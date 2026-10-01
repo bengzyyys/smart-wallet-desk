@@ -54,6 +54,7 @@ type policy struct {
 	maxTotal          int64
 	approvalThreshold int64
 	approvalWait      time.Duration
+	reservationTimeout time.Duration
 	reservedTotal     int64
 	spentTotal        int64
 
@@ -80,6 +81,9 @@ type request struct {
 	decidedAt         time.Time
 	approverAccountID string
 	rejectReason      string
+	reservedAt        time.Time
+	reservationDeadline time.Time
+	timedOutAt        time.Time
 }
 
 type requestKey struct {
@@ -126,6 +130,8 @@ func (w *Wallet) CreateAccount(id string, initialBalance int64) (AccountView, er
 func (w *Wallet) Account(id string) (AccountView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	acc, ok := w.accounts[id]
 	if !ok {
@@ -178,6 +184,8 @@ func (w *Wallet) CreateSession(id, accountID, deviceID string, expiresAt time.Ti
 func (w *Wallet) RevokeSession(id string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	sess, ok := w.sessions[id]
 	if !ok {
@@ -245,6 +253,10 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 			return fmt.Errorf("%w: approval wait must be positive when approval is enabled", ErrPolicyInvalid)
 		}
 	}
+	// 预留超时：零表示不启用；不得为负。
+	if spec.ReservationTimeout < 0 {
+		return fmt.Errorf("%w: reservation timeout must not be negative", ErrPolicyInvalid)
+	}
 	if !spec.StartsAt.Before(spec.EndsAt) {
 		return fmt.Errorf("%w: starts-at must be before ends-at", ErrPolicyInvalid)
 	}
@@ -270,17 +282,18 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 	}
 
 	w.policies[spec.ID] = &policy{
-		id:                spec.ID,
-		payerAccountID:    spec.PayerAccountID,
-		allowedAccounts:   allowed,
-		operation:         spec.Operation,
-		payee:             spec.Payee,
-		startsAt:          spec.StartsAt,
-		endsAt:            spec.EndsAt,
-		maxPerRequest:     spec.MaxPerRequest,
-		maxTotal:          spec.MaxTotal,
-		approvalThreshold: spec.ApprovalThreshold,
-		approvalWait:      spec.ApprovalWait,
+		id:                 spec.ID,
+		payerAccountID:     spec.PayerAccountID,
+		allowedAccounts:    allowed,
+		operation:          spec.Operation,
+		payee:              spec.Payee,
+		startsAt:           spec.StartsAt,
+		endsAt:             spec.EndsAt,
+		maxPerRequest:      spec.MaxPerRequest,
+		maxTotal:           spec.MaxTotal,
+		approvalThreshold:  spec.ApprovalThreshold,
+		approvalWait:       spec.ApprovalWait,
+		reservationTimeout: spec.ReservationTimeout,
 	}
 	return nil
 }
@@ -289,6 +302,8 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 func (w *Wallet) Policy(id string) (PolicyView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	p, ok := w.policies[id]
 	if !ok {
@@ -322,6 +337,8 @@ func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) 
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	p, ok := w.policies[policyID]
 	if !ok {
@@ -431,6 +448,7 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	defer w.mu.Unlock()
 
 	now := w.now()
+	w.refreshAllLocked(now)
 
 	acc, ok := w.accounts[in.AccountID]
 	if !ok {
@@ -458,8 +476,8 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 
 	key := requestKey{accountID: in.AccountID, requestID: in.RequestID}
 	if existing, ok := w.requests[key]; ok {
-		// 待审批请求到期即过期，重复申请看到的应是最新终态。
-		w.refreshPendingLocked(existing, now)
+		// 待审批请求到期即过期，已预留请求超时即释放，重复申请看到的应是最新终态。
+		w.refreshLocked(existing, now)
 		if existing.policyID == in.PolicyID &&
 			existing.operation == in.Operation &&
 			existing.payee == in.Payee &&
@@ -561,6 +579,11 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 		estimatedFee:   in.EstimatedFee,
 		state:          RequestReserved,
 		createdAt:      now,
+		reservedAt:     now,
+	}
+	// 启用超时：截止时刻 = 预留时刻 + 最长预留时长。
+	if p.reservationTimeout > 0 {
+		req.reservationDeadline = now.Add(p.reservationTimeout)
 	}
 	w.requests[key] = req
 	w.ledger = append(w.ledger, LedgerEntry{
@@ -586,11 +609,13 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.refreshAllLocked(w.now())
+
 	req, p, err := w.lookupRequest(accountID, requestID)
 	if err != nil {
 		return RequestView{}, err
 	}
-	w.refreshPendingLocked(req, w.now())
+	w.refreshLocked(req, w.now())
 	switch req.state {
 	case RequestSettled:
 		if req.actualFee == actualFee {
@@ -599,6 +624,9 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 		return RequestView{}, fmt.Errorf("%w: request %s already settled with actual fee %d", ErrConflict, requestID, req.actualFee)
 	case RequestCancelled:
 		return RequestView{}, fmt.Errorf("%w: request %s", ErrAlreadyCancelled, requestID)
+	case RequestReservationTimeout:
+		// 预留已超时释放，不能再结算扣款。
+		return RequestView{}, fmt.Errorf("%w: request %s reservation timed out at %s", ErrReservationTimeout, requestID, req.timedOutAt.Format(time.RFC3339))
 	case RequestPendingApproval, RequestRejected, RequestExpired:
 		// 结算只允许处理已预留请求。
 		return RequestView{}, fmt.Errorf("%w: request %s is %v, only reserved requests can be settled", ErrRequestNotReserved, requestID, req.state)
@@ -653,14 +681,19 @@ func (w *Wallet) Cancel(accountID, requestID string) (RequestView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.refreshAllLocked(w.now())
+
 	req, p, err := w.lookupRequest(accountID, requestID)
 	if err != nil {
 		return RequestView{}, err
 	}
 	now := w.now()
-	w.refreshPendingLocked(req, now)
+	w.refreshLocked(req, now)
 	switch req.state {
 	case RequestCancelled:
+		return req.view(), nil
+	case RequestReservationTimeout:
+		// 预留已超时释放：返回已有超时结果，不重复退回。
 		return req.view(), nil
 	case RequestSettled:
 		return RequestView{}, fmt.Errorf("%w: request %s", ErrAlreadySettled, requestID)
@@ -717,6 +750,7 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 	defer w.mu.Unlock()
 
 	now := w.now()
+	w.refreshAllLocked(now)
 	req, p, err := w.lookupRequest(accountID, requestID)
 	if err != nil {
 		return RequestView{}, err
@@ -724,7 +758,7 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 	if err := w.checkApproverLocked(req, sessionID, deviceID, now); err != nil {
 		return RequestView{}, err
 	}
-	w.refreshPendingLocked(req, now)
+	w.refreshLocked(req, now)
 	if req.state == RequestExpired {
 		return RequestView{}, fmt.Errorf("%w: approval deadline %s passed", ErrApprovalExpired, req.waitDeadline.Format(time.RFC3339))
 	}
@@ -747,6 +781,11 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 		req.state = RequestReserved
 		req.decidedAt = now
 		req.approverAccountID = payer.id
+		req.reservedAt = now
+		// 启用超时：截止时刻 = 批准预留时刻 + 最长预留时长。
+		if p.reservationTimeout > 0 {
+			req.reservationDeadline = now.Add(p.reservationTimeout)
+		}
 
 		w.ledger = append(w.ledger,
 			LedgerEntry{
@@ -793,6 +832,7 @@ func (w *Wallet) Reject(accountID, requestID, sessionID, deviceID, reason string
 	defer w.mu.Unlock()
 
 	now := w.now()
+	w.refreshAllLocked(now)
 	req, _, err := w.lookupRequest(accountID, requestID)
 	if err != nil {
 		return RequestView{}, err
@@ -800,7 +840,7 @@ func (w *Wallet) Reject(accountID, requestID, sessionID, deviceID, reason string
 	if err := w.checkApproverLocked(req, sessionID, deviceID, now); err != nil {
 		return RequestView{}, err
 	}
-	w.refreshPendingLocked(req, now)
+	w.refreshLocked(req, now)
 
 	switch req.state {
 	case RequestPendingApproval:
@@ -870,17 +910,76 @@ func (w *Wallet) refreshPendingLocked(req *request, now time.Time) {
 	})
 }
 
+// refreshReservationTimeoutLocked 在持锁状态下检查已预留请求是否已超过
+// 最长预留时长；超时（含截止时刻）则退回全部预估费用并转为预留超时终态。
+// 释放时间记录截止时刻，与查询时刻无关。必须在持锁状态下调用。
+func (w *Wallet) refreshReservationTimeoutLocked(req *request, now time.Time) {
+	if req.state != RequestReserved {
+		return
+	}
+	if req.reservationDeadline.IsZero() {
+		// 未启用超时。
+		return
+	}
+	if now.Before(req.reservationDeadline) {
+		return
+	}
+	// 超时释放：退回全部预估费用，减少出资账户预留余额与该策略预留总额。
+	payer := w.accounts[req.payerAccountID]
+	p := w.policies[req.policyID]
+	payer.reserved -= req.estimatedFee
+	payer.available += req.estimatedFee
+	if p != nil {
+		p.reservedTotal -= req.estimatedFee
+	}
+	req.state = RequestReservationTimeout
+	req.timedOutAt = req.reservationDeadline
+	w.ledger = append(w.ledger,
+		LedgerEntry{
+			Kind:      LedgerRefund,
+			AccountID: payer.id,
+			RequestID: req.requestID,
+			Amount:    req.estimatedFee,
+			Reason:    "refund reserved fee on reservation timeout",
+			At:        req.reservationDeadline,
+		},
+		LedgerEntry{
+			Kind:      LedgerReservationTimeout,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "reservation timed out",
+			At:        req.reservationDeadline,
+		},
+	)
+}
+
+// refreshLocked 在持锁状态下刷新单个请求的待审批过期与预留超时状态。
+// 必须在持锁状态下调用。
+func (w *Wallet) refreshLocked(req *request, now time.Time) {
+	w.refreshPendingLocked(req, now)
+	w.refreshReservationTimeoutLocked(req, now)
+}
+
+// refreshAllLocked 在持锁状态下遍历全部请求，刷新待审批过期与预留超时
+// 状态，使查询结果反映查询时已到期预留的释放结果。必须在持锁状态下调用。
+func (w *Wallet) refreshAllLocked(now time.Time) {
+	for _, req := range w.requests {
+		w.refreshLocked(req, now)
+	}
+}
+
 // Request 查询某使用账户下的代付请求。待审批请求到期即转为过期终态，
-// 查询结果反映最新状态。
+// 已预留请求超时即转为预留超时终态，查询结果反映最新状态。
 func (w *Wallet) Request(accountID, requestID string) (RequestView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	req, _, err := w.lookupRequest(accountID, requestID)
 	if err != nil {
 		return RequestView{}, err
 	}
-	w.refreshPendingLocked(req, w.now())
 	return req.view(), nil
 }
 
@@ -889,6 +988,8 @@ func (w *Wallet) Request(accountID, requestID string) (RequestView, error) {
 func (w *Wallet) Ledger() []LedgerEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	out := make([]LedgerEntry, len(w.ledger))
 	copy(out, w.ledger)
@@ -903,6 +1004,8 @@ func (w *Wallet) Ledger() []LedgerEntry {
 func (w *Wallet) AccountLedger(accountID string) []LedgerEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.refreshAllLocked(w.now())
 
 	var out []LedgerEntry
 	for _, e := range w.ledger {
@@ -981,17 +1084,18 @@ func (p *policy) view() PolicyView {
 	}
 	return PolicyView{
 		PolicySpec: PolicySpec{
-			ID:                p.id,
-			PayerAccountID:    p.payerAccountID,
-			AllowedAccountIDs: ids,
-			Operation:         p.operation,
-			Payee:             p.payee,
-			StartsAt:          p.startsAt,
-			EndsAt:            p.endsAt,
-			MaxPerRequest:     p.maxPerRequest,
-			MaxTotal:          p.maxTotal,
-			ApprovalThreshold: p.approvalThreshold,
-			ApprovalWait:      p.approvalWait,
+			ID:                 p.id,
+			PayerAccountID:     p.payerAccountID,
+			AllowedAccountIDs:  ids,
+			Operation:          p.operation,
+			Payee:              p.payee,
+			StartsAt:           p.startsAt,
+			EndsAt:             p.endsAt,
+			MaxPerRequest:      p.maxPerRequest,
+			MaxTotal:           p.maxTotal,
+			ApprovalThreshold:  p.approvalThreshold,
+			ApprovalWait:       p.approvalWait,
+			ReservationTimeout: p.reservationTimeout,
 		},
 		ReservedTotal:        p.reservedTotal,
 		SpentTotal:           p.spentTotal,
@@ -1004,20 +1108,23 @@ func (p *policy) view() PolicyView {
 
 func (r *request) view() RequestView {
 	return RequestView{
-		PolicyID:          r.policyID,
-		RequestID:         r.requestID,
-		AccountID:         r.accountID,
-		PayerAccountID:    r.payerAccountID,
-		Operation:         r.operation,
-		Payee:             r.payee,
-		EstimatedFee:      r.estimatedFee,
-		ActualFee:         r.actualFee,
-		State:             r.state,
-		CreatedAt:         r.createdAt,
-		SettledAt:         r.settledAt,
-		WaitDeadline:      r.waitDeadline,
-		DecidedAt:         r.decidedAt,
-		ApproverAccountID: r.approverAccountID,
-		RejectReason:      r.rejectReason,
+		PolicyID:            r.policyID,
+		RequestID:           r.requestID,
+		AccountID:           r.accountID,
+		PayerAccountID:      r.payerAccountID,
+		Operation:           r.operation,
+		Payee:               r.payee,
+		EstimatedFee:        r.estimatedFee,
+		ActualFee:           r.actualFee,
+		State:               r.state,
+		CreatedAt:           r.createdAt,
+		SettledAt:           r.settledAt,
+		WaitDeadline:        r.waitDeadline,
+		DecidedAt:           r.decidedAt,
+		ApproverAccountID:   r.approverAccountID,
+		RejectReason:        r.rejectReason,
+		ReservedAt:          r.reservedAt,
+		ReservationDeadline: r.reservationDeadline,
+		TimedOutAt:          r.timedOutAt,
 	}
 }

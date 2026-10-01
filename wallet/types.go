@@ -66,6 +66,10 @@ type PolicySpec struct {
 	// ApprovalWait 为待审批请求的最长等待时长（自提交时刻起算）。
 	// 审批开启（ApprovalThreshold 为正）时必须为正；关闭时忽略。
 	ApprovalWait time.Duration
+	// ReservationTimeout 为已预留请求的最长预留时长：自预留成功时刻起算，
+	// 超过该时长未结算或取消的请求自动退回全部预估费用并进入预留超时终态。
+	// 零表示不启用超时（保持现有行为）；不得为负。
+	ReservationTimeout time.Duration
 }
 
 // PolicyView 是策略的只读视图。
@@ -104,6 +108,9 @@ const (
 	RequestRejected
 	// RequestExpired 待审批超过等待期限未获批准，终态。
 	RequestExpired
+	// RequestReservationTimeout 已预留请求超过最长预留时长未结算或取消，
+	// 预留已全部退回，终态。与审批等待过期（RequestExpired）区分。
+	RequestReservationTimeout
 )
 
 // RequestInput 是代付申请内容。
@@ -148,6 +155,14 @@ type RequestView struct {
 	ApproverAccountID string
 	// RejectReason 为拒绝原因（审批拒绝、会话吊销或策略停用）；未拒绝时为空。
 	RejectReason string
+	// ReservedAt 为实际预留时间（直接预留为受理时刻，批准后预留为批准时刻）；
+	// 尚未预留（待审批、拒绝、过期、取消）时为零值。
+	ReservedAt time.Time
+	// ReservationDeadline 为启用超时后的截止时间（ReservedAt + 策略最长预留时长）；
+	// 未启用超时或尚未预留时为零值。
+	ReservationDeadline time.Time
+	// TimedOutAt 为超时释放时间（即截止时刻）；未发生超时或未启用超时时为零值。
+	TimedOutAt time.Time
 }
 
 // LedgerKind 标识账本记录类型。
@@ -175,6 +190,10 @@ const (
 	// LedgerPolicyDeactivation 策略被出资账户主动停用的留痕，无金额变动；
 	// AccountID 为出资账户，PolicyID 为被停用的策略，RequestID 为空。
 	LedgerPolicyDeactivation
+	// LedgerReservationTimeout 已预留请求超时未结算或取消的状态留痕，无金额变动；
+	// AccountID 为发起申请的使用账户，RequestID 为超时的请求编号。
+	// 超时带来的全额退款另记 LedgerRefund（出资账户）。
+	LedgerReservationTimeout
 )
 
 // LedgerEntry 是一条账本记录。
