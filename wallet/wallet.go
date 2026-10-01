@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -54,8 +55,10 @@ type policy struct {
 	maxTotal          int64
 	approvalThreshold int64
 	approvalWait      time.Duration
-	reservedTotal     int64
-	spentTotal        int64
+	// maxReserveDuration 为最长预留时长；零表示关闭预留超时。
+	maxReserveDuration time.Duration
+	reservedTotal      int64
+	spentTotal         int64
 
 	deactivated          bool
 	deactivatedAt        time.Time
@@ -64,19 +67,27 @@ type policy struct {
 }
 
 type request struct {
-	policyID          string
-	requestID         string
-	accountID         string
-	payerAccountID    string
-	sessionID         string
-	operation         string
-	payee             string
-	estimatedFee      int64
-	actualFee         int64
-	state             RequestState
-	createdAt         time.Time
-	settledAt         time.Time
-	waitDeadline      time.Time
+	policyID       string
+	requestID      string
+	accountID      string
+	payerAccountID string
+	sessionID      string
+	operation      string
+	payee          string
+	estimatedFee   int64
+	actualFee      int64
+	state          RequestState
+	createdAt      time.Time
+	settledAt      time.Time
+	waitDeadline   time.Time
+	// reservedAt 为费用实际预留完成的时刻（直接受理或批准成功的时刻）。
+	reservedAt time.Time
+	// reserveDuration 为预留时适用的最长预留时长快照；零表示未启用超时。
+	reserveDuration time.Duration
+	// reserveDeadline 为预留截止时刻（reservedAt + reserveDuration）。
+	reserveDeadline time.Time
+	// reserveExpiredAt 为超时释放时间；惰性处理时记录的仍是截止时刻本身。
+	reserveExpiredAt  time.Time
 	decidedAt         time.Time
 	approverAccountID string
 	rejectReason      string
@@ -123,6 +134,7 @@ func (w *Wallet) CreateAccount(id string, initialBalance int64) (AccountView, er
 }
 
 // Account 查询账户视图；账户不存在时返回 ErrAccountNotFound。
+// 查询时已到期的预留会先被自动释放，因此视图反映最新的可用/预留余额。
 func (w *Wallet) Account(id string) (AccountView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -131,6 +143,7 @@ func (w *Wallet) Account(id string) (AccountView, error) {
 	if !ok {
 		return AccountView{}, fmt.Errorf("%w: %s", ErrAccountNotFound, id)
 	}
+	w.expireReservationsLocked(w.now())
 	return acc.view(), nil
 }
 
@@ -245,6 +258,10 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 			return fmt.Errorf("%w: approval wait must be positive when approval is enabled", ErrPolicyInvalid)
 		}
 	}
+	// 最长预留时长：零表示关闭预留超时（保持既有行为）；不得为负。
+	if spec.MaxReserveDuration < 0 {
+		return fmt.Errorf("%w: max reserve duration must not be negative", ErrPolicyInvalid)
+	}
 	if !spec.StartsAt.Before(spec.EndsAt) {
 		return fmt.Errorf("%w: starts-at must be before ends-at", ErrPolicyInvalid)
 	}
@@ -270,22 +287,24 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 	}
 
 	w.policies[spec.ID] = &policy{
-		id:                spec.ID,
-		payerAccountID:    spec.PayerAccountID,
-		allowedAccounts:   allowed,
-		operation:         spec.Operation,
-		payee:             spec.Payee,
-		startsAt:          spec.StartsAt,
-		endsAt:            spec.EndsAt,
-		maxPerRequest:     spec.MaxPerRequest,
-		maxTotal:          spec.MaxTotal,
-		approvalThreshold: spec.ApprovalThreshold,
-		approvalWait:      spec.ApprovalWait,
+		id:                 spec.ID,
+		payerAccountID:     spec.PayerAccountID,
+		allowedAccounts:    allowed,
+		operation:          spec.Operation,
+		payee:              spec.Payee,
+		startsAt:           spec.StartsAt,
+		endsAt:             spec.EndsAt,
+		maxPerRequest:      spec.MaxPerRequest,
+		maxTotal:           spec.MaxTotal,
+		approvalThreshold:  spec.ApprovalThreshold,
+		approvalWait:       spec.ApprovalWait,
+		maxReserveDuration: spec.MaxReserveDuration,
 	}
 	return nil
 }
 
-// Policy 查询策略视图，含当前预留中与已结算的累计金额。
+// Policy 查询策略视图，含当前预留中与已结算的累计金额。查询时已到期的
+// 预留会先被自动释放，ReservedTotal 因而反映释放后的结果。
 func (w *Wallet) Policy(id string) (PolicyView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -294,6 +313,7 @@ func (w *Wallet) Policy(id string) (PolicyView, error) {
 	if !ok {
 		return PolicyView{}, fmt.Errorf("%w: %s", ErrPolicyNotFound, id)
 	}
+	w.expireReservationsLocked(w.now())
 	return p.view(), nil
 }
 
@@ -331,6 +351,8 @@ func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) 
 	if err := w.checkPolicyOwnerLocked(p, sessionID, deviceID, now); err != nil {
 		return PolicyView{}, err
 	}
+	// 鉴权通过后先释放已到期预留（停用不缩短任何未到期请求的截止时间）。
+	w.expireReservationsLocked(now)
 
 	if p.deactivated {
 		// 停用不可撤销：理由相同返回首次结果，理由不同返回冲突，
@@ -458,8 +480,9 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 
 	key := requestKey{accountID: in.AccountID, requestID: in.RequestID}
 	if existing, ok := w.requests[key]; ok {
-		// 待审批请求到期即过期，重复申请看到的应是最新终态。
+		// 待审批到期即过期、已预留到期即自动退回，重复申请看到的应是最新终态。
 		w.refreshPendingLocked(existing, now)
+		w.refreshReservedLocked(existing, now)
 		if existing.policyID == in.PolicyID &&
 			existing.operation == in.Operation &&
 			existing.payee == in.Payee &&
@@ -495,6 +518,9 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	if in.EstimatedFee > p.maxPerRequest {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: estimated fee %d exceeds per-request limit %d", ErrQuotaExceeded, in.EstimatedFee, p.maxPerRequest))
 	}
+	// 资金与额度检查前释放所有已到期预留（含同一出资账户在其他策略下的
+	// 预留），因此先查余额还是先申请看到的可用金额都一致。
+	w.expireReservationsLocked(now)
 	// 预留中的费用同样占用共享累计额度。
 	if p.reservedTotal+p.spentTotal+in.EstimatedFee > p.maxTotal {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
@@ -562,6 +588,8 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 		state:          RequestReserved,
 		createdAt:      now,
 	}
+	// 直接受理：从受理时刻起算最长预留时长。
+	withReserveTimingLocked(req, p, now)
 	w.requests[key] = req
 	w.ledger = append(w.ledger, LedgerEntry{
 		Kind:      LedgerReserve,
@@ -590,7 +618,10 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 	if err != nil {
 		return RequestView{}, err
 	}
-	w.refreshPendingLocked(req, w.now())
+	now := w.now()
+	w.refreshPendingLocked(req, now)
+	// 已到最长预留时长的预留先自动退回：此后任何结算都不能再扣款。
+	w.refreshReservedLocked(req, now)
 	switch req.state {
 	case RequestSettled:
 		if req.actualFee == actualFee {
@@ -599,6 +630,9 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 		return RequestView{}, fmt.Errorf("%w: request %s already settled with actual fee %d", ErrConflict, requestID, req.actualFee)
 	case RequestCancelled:
 		return RequestView{}, fmt.Errorf("%w: request %s", ErrAlreadyCancelled, requestID)
+	case RequestReservationExpired:
+		// 预留已超时全额退回：传入非负实际费用也返回明确的超时错误，不能扣款。
+		return RequestView{}, fmt.Errorf("%w: request %s reservation expired at %s", ErrReservationExpired, requestID, req.reserveExpiredAt.Format(time.RFC3339))
 	case RequestPendingApproval, RequestRejected, RequestExpired:
 		// 结算只允许处理已预留请求。
 		return RequestView{}, fmt.Errorf("%w: request %s is %v, only reserved requests can be settled", ErrRequestNotReserved, requestID, req.state)
@@ -609,7 +643,6 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 		return RequestView{}, fmt.Errorf("%w: actual %d > estimated %d for request %s", ErrSettleTooLarge, actualFee, req.estimatedFee, requestID)
 	}
 
-	now := w.now()
 	payer := w.accounts[req.payerAccountID]
 	refund := req.estimatedFee - actualFee
 
@@ -659,11 +692,16 @@ func (w *Wallet) Cancel(accountID, requestID string) (RequestView, error) {
 	}
 	now := w.now()
 	w.refreshPendingLocked(req, now)
+	// 已到最长预留时长的预留先自动退回。
+	w.refreshReservedLocked(req, now)
 	switch req.state {
 	case RequestCancelled:
 		return req.view(), nil
 	case RequestSettled:
 		return RequestView{}, fmt.Errorf("%w: request %s", ErrAlreadySettled, requestID)
+	case RequestReservationExpired:
+		// 预留已超时自动全额退回：取消幂等返回已有超时结果，不重复退回、不留痕。
+		return req.view(), nil
 	case RequestPendingApproval:
 		// 待审批取消：无资金冻结，直接留取消终态。
 		req.state = RequestCancelled
@@ -724,6 +762,10 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 	if err := w.checkApproverLocked(req, sessionID, deviceID, now); err != nil {
 		return RequestView{}, err
 	}
+	// 鉴权通过后释放已到期预留（含同一出资账户在其他策略下的预留），使
+	// 批准的余额与额度检查计入退回；因余额或额度不足而失败的批准不会开始
+	// 预留计时。
+	w.expireReservationsLocked(now)
 	w.refreshPendingLocked(req, now)
 	if req.state == RequestExpired {
 		return RequestView{}, fmt.Errorf("%w: approval deadline %s passed", ErrApprovalExpired, req.waitDeadline.Format(time.RFC3339))
@@ -747,6 +789,8 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 		req.state = RequestReserved
 		req.decidedAt = now
 		req.approverAccountID = payer.id
+		// 待审批请求：等待审批的时间不计入，从批准成功时刻起算最长预留时长。
+		withReserveTimingLocked(req, p, now)
 
 		w.ledger = append(w.ledger,
 			LedgerEntry{
@@ -870,8 +914,93 @@ func (w *Wallet) refreshPendingLocked(req *request, now time.Time) {
 	})
 }
 
+// refreshReservedLocked 在持锁状态下检查单笔已预留请求是否已到最长预留
+// 时长；截止时刻及之后转为“预留超时”终态并退回全额预留。必须在持锁状态
+// 下调用。
+func (w *Wallet) refreshReservedLocked(req *request, now time.Time) {
+	if req.state != RequestReserved || req.reserveDuration <= 0 {
+		return
+	}
+	if now.Before(req.reserveDeadline) {
+		return
+	}
+	w.expireReservationLocked(req, req.reserveDeadline)
+}
+
+// expireReservationsLocked 惰性结清当前全部已到期（含到期时刻）的预留。
+// 所有账户/余额/策略/请求/账本查询以及新申请、批准的资金检查入口都先调用
+// 它，因此调用者无须逐笔取消即可看到已到期预留的释放结果。释放时间一律
+// 记录为各请求自己的截止时刻，而不是处理时刻；账本按截止时刻顺序追加。
+// 必须在持锁状态下调用。
+func (w *Wallet) expireReservationsLocked(now time.Time) {
+	due := make([]*request, 0)
+	for _, req := range w.requests {
+		if req.state == RequestReserved && req.reserveDuration > 0 && !now.Before(req.reserveDeadline) {
+			due = append(due, req)
+		}
+	}
+	sort.SliceStable(due, func(i, j int) bool {
+		if due[i].reserveDeadline.Equal(due[j].reserveDeadline) {
+			if due[i].accountID != due[j].accountID {
+				return due[i].accountID < due[j].accountID
+			}
+			return due[i].requestID < due[j].requestID
+		}
+		return due[i].reserveDeadline.Before(due[j].reserveDeadline)
+	})
+	for _, req := range due {
+		w.expireReservationLocked(req, req.reserveDeadline)
+	}
+}
+
+// expireReservationLocked 将一笔已预留请求转为 RequestReservationExpired
+// 终态：全额退回预估费用到出资账户可用余额，减少出资账户预留余额与该
+// 策略的预留总额，不增加实际费用或已花费总额。账本增加一条出资账户的
+// 全额退款记录和一条使用账户的零金额超时状态记录，均关联请求编号。
+// 必须在持锁状态下调用。
+func (w *Wallet) expireReservationLocked(req *request, deadline time.Time) {
+	payer := w.accounts[req.payerAccountID]
+	payer.reserved -= req.estimatedFee
+	payer.available += req.estimatedFee
+	if p := w.policies[req.policyID]; p != nil {
+		p.reservedTotal -= req.estimatedFee
+	}
+	req.state = RequestReservationExpired
+	req.reserveExpiredAt = deadline
+
+	w.ledger = append(w.ledger,
+		LedgerEntry{
+			Kind:      LedgerRefund,
+			AccountID: payer.id,
+			RequestID: req.requestID,
+			Amount:    req.estimatedFee,
+			Reason:    "refund reserved fee on reservation timeout",
+			At:        deadline,
+		},
+		LedgerEntry{
+			Kind:      LedgerReservationExpiration,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "reservation timed out before settlement",
+			At:        deadline,
+		},
+	)
+}
+
+// withReserveTimingLocked 在费用完成预留时写入预留计时信息：预留时刻为
+// 受理/批准成功的时刻，截止时刻为预留时刻加策略最长预留时长；策略未启用
+// 超时（时长为零）时截止时刻保持零值。必须在持锁状态下调用。
+func withReserveTimingLocked(req *request, p *policy, reservedAt time.Time) {
+	req.reservedAt = reservedAt
+	req.reserveDuration = p.maxReserveDuration
+	if p.maxReserveDuration > 0 {
+		req.reserveDeadline = reservedAt.Add(p.maxReserveDuration)
+	}
+}
+
 // Request 查询某使用账户下的代付请求。待审批请求到期即转为过期终态，
-// 查询结果反映最新状态。
+// 已预留请求到最长预留时长即转为预留超时终态，查询结果反映最新状态；
+// 超时释放时间记录的是截止时刻本身，而不是本次查询时刻。
 func (w *Wallet) Request(accountID, requestID string) (RequestView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -880,16 +1009,20 @@ func (w *Wallet) Request(accountID, requestID string) (RequestView, error) {
 	if err != nil {
 		return RequestView{}, err
 	}
-	w.refreshPendingLocked(req, w.now())
+	now := w.now()
+	w.refreshPendingLocked(req, now)
+	w.refreshReservedLocked(req, now)
 	return req.view(), nil
 }
 
 // Ledger 返回全部账本记录的副本，按产生顺序排列。
 // 申请被拒绝的记录（Kind 为 LedgerRejection）也包含在内并带有原因。
+// 查询时已到期预留的自动退款与超时留痕也会在返回前补齐。
 func (w *Wallet) Ledger() []LedgerEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.expireReservationsLocked(w.now())
 	out := make([]LedgerEntry, len(w.ledger))
 	copy(out, w.ledger)
 	return out
@@ -904,6 +1037,7 @@ func (w *Wallet) AccountLedger(accountID string) []LedgerEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	w.expireReservationsLocked(w.now())
 	var out []LedgerEntry
 	for _, e := range w.ledger {
 		if e.AccountID == accountID {
@@ -981,17 +1115,18 @@ func (p *policy) view() PolicyView {
 	}
 	return PolicyView{
 		PolicySpec: PolicySpec{
-			ID:                p.id,
-			PayerAccountID:    p.payerAccountID,
-			AllowedAccountIDs: ids,
-			Operation:         p.operation,
-			Payee:             p.payee,
-			StartsAt:          p.startsAt,
-			EndsAt:            p.endsAt,
-			MaxPerRequest:     p.maxPerRequest,
-			MaxTotal:          p.maxTotal,
-			ApprovalThreshold: p.approvalThreshold,
-			ApprovalWait:      p.approvalWait,
+			ID:                 p.id,
+			PayerAccountID:     p.payerAccountID,
+			AllowedAccountIDs:  ids,
+			Operation:          p.operation,
+			Payee:              p.payee,
+			StartsAt:           p.startsAt,
+			EndsAt:             p.endsAt,
+			MaxPerRequest:      p.maxPerRequest,
+			MaxTotal:           p.maxTotal,
+			ApprovalThreshold:  p.approvalThreshold,
+			ApprovalWait:       p.approvalWait,
+			MaxReserveDuration: p.maxReserveDuration,
 		},
 		ReservedTotal:        p.reservedTotal,
 		SpentTotal:           p.spentTotal,
@@ -1016,6 +1151,10 @@ func (r *request) view() RequestView {
 		CreatedAt:         r.createdAt,
 		SettledAt:         r.settledAt,
 		WaitDeadline:      r.waitDeadline,
+		ReservedAt:        r.reservedAt,
+		ReserveDuration:   r.reserveDuration,
+		ReserveDeadline:   r.reserveDeadline,
+		ReserveExpiredAt:  r.reserveExpiredAt,
 		DecidedAt:         r.decidedAt,
 		ApproverAccountID: r.approverAccountID,
 		RejectReason:      r.rejectReason,

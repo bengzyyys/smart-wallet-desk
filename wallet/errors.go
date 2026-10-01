@@ -67,4 +67,8 @@ var (
 	// ErrRequestNotReserved 请求不处于已预留状态，不能结算或（在拒绝、
 	// 过期终态下）取消。
 	ErrRequestNotReserved = errors.New("wallet: request is not reserved")
+	// ErrReservationExpired 请求的预留已超过最长预留时长自动退回，终态。
+	// 此时结算（即使实际费用非负）也不能再扣款；取消与同号同内容申请幂等
+	// 返回已有超时结果。
+	ErrReservationExpired = errors.New("wallet: reservation expired")
 )

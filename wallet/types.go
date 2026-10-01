@@ -66,6 +66,10 @@ type PolicySpec struct {
 	// ApprovalWait 为待审批请求的最长等待时长（自提交时刻起算）。
 	// 审批开启（ApprovalThreshold 为正）时必须为正；关闭时忽略。
 	ApprovalWait time.Duration
+	// MaxReserveDuration 为已预留请求的最长预留时长：自直接受理时刻，或
+	// 待审批请求被批准成功的时刻起算（等待审批的时间不计入）。零表示关闭
+	// 预留超时，已预留费用只在结算或取消时释放；不得为负。
+	MaxReserveDuration time.Duration
 }
 
 // PolicyView 是策略的只读视图。
@@ -104,6 +108,10 @@ const (
 	RequestRejected
 	// RequestExpired 待审批超过等待期限未获批准，终态。
 	RequestExpired
+	// RequestReservationExpired 已预留请求超过策略的最长预留时长仍未结算或
+	// 取消，终态。预留已在截止时刻全额自动退回，与待审批等待过期
+	// （RequestExpired）区分。
+	RequestReservationExpired
 )
 
 // RequestInput 是代付申请内容。
@@ -142,6 +150,19 @@ type RequestView struct {
 	// WaitDeadline 为待审批期限（提交时刻 + 等待时长、策略结束时间、
 	// 申请会话到期时间三者中的最早值）；非待审批请求为零值。
 	WaitDeadline time.Time
+	// ReservedAt 为费用实际预留完成的时刻：直接受理的请求为受理时刻，
+	// 批准后预留的请求为批准成功时刻。从未预留（待审批、被拒、待审批过期、
+	// 待审批取消）时为零值；预留超时后仍保留该时刻。
+	ReservedAt time.Time
+	// ReserveDuration 为受理/批准时适用的策略最长预留时长；策略未启用预留
+	// 超时（时长为零）或请求从未预留时为零。
+	ReserveDuration time.Duration
+	// ReserveDeadline 为启用预留超时时的截止时刻（预留时刻 + 最长预留时长）；
+	// 未启用或请求从未预留时为零值。结算或取消不会改变该时刻。
+	ReserveDeadline time.Time
+	// ReserveExpiredAt 为预留因超时自动释放的时刻；记录的是截止时刻本身，
+	// 而非稍后实际处理（查询或新申请）的时刻。尚未超时或未启用时为零值。
+	ReserveExpiredAt time.Time
 	// DecidedAt 为审批决定时间（批准、拒绝或过期的时刻）；未决定时为零值。
 	DecidedAt time.Time
 	// ApproverAccountID 为作出批准或拒绝决定的出资账户；未决定时为空。
@@ -175,6 +196,10 @@ const (
 	// LedgerPolicyDeactivation 策略被出资账户主动停用的留痕，无金额变动；
 	// AccountID 为出资账户，PolicyID 为被停用的策略，RequestID 为空。
 	LedgerPolicyDeactivation
+	// LedgerReservationExpiration 已预留请求超过最长预留时长被自动退回的
+	// 状态留痕，无金额变动；AccountID 为发起申请的使用账户，关联请求编号。
+	// 全额退款另记一条 LedgerRefund（AccountID 为出资账户，金额为预留全额）。
+	LedgerReservationExpiration
 )
 
 // LedgerEntry 是一条账本记录。
