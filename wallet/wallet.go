@@ -56,6 +56,10 @@ type policy struct {
 	approvalWait      time.Duration
 	reservedTotal     int64
 	spentTotal        int64
+	disabled          bool
+	disabledAt        time.Time
+	disabledBy        string
+	disableReason     string
 }
 
 type request struct {
@@ -292,6 +296,124 @@ func (w *Wallet) Policy(id string) (PolicyView, error) {
 	return p.view(), nil
 }
 
+// DisablePolicy 出资账户主动停用一条代付策略，立即停止其继续受理代付。
+//
+// 必须使用该策略出资账户绑定当前设备的有效会话；会话不存在、不属于出资
+// 账户、设备不符、已吊销或已到期时返回 ErrNotPayer 无权停用，且不改变
+// 策略、请求或账本。策略编号、会话编号、设备或理由缺失时返回
+// ErrInvalidArgument；理由去掉首尾空白后为空同样返回 ErrInvalidArgument，
+// 保存及比较理由均使用去掉首尾空白后的内容。策略不存在返回
+// ErrPolicyNotFound。
+//
+// 停用不可撤销。重复停用时仍须通过会话校验：理由与首次一致返回首次结果，
+// 理由不同返回 ErrConflict，均不改写首次信息、不新增账本记录。
+//
+// 停用成功后，该策略下所有未到等待期限的待审批请求立即转为拒绝终态
+// （拒绝信息说明策略被停用并包含停用理由，决定时间为停用时间）；已到或
+// 超过等待期限的待审批请求转为过期终态。两类处理都不冻结余额、不占用
+// 额度、不产生退款。已预留请求保留原有状态和金额，仍可按现有规则结算或
+// 取消；已结算、拒绝、过期和取消的记录不改写，其他策略不受影响。
+func (w *Wallet) DisablePolicy(policyID, sessionID, deviceID, reason string) (PolicyView, error) {
+	if policyID == "" || sessionID == "" || deviceID == "" {
+		return PolicyView{}, fmt.Errorf("%w: policy id, session id and device id are required", ErrInvalidArgument)
+	}
+	trimmed := strings.TrimSpace(reason)
+	if trimmed == "" {
+		return PolicyView{}, fmt.Errorf("%w: disable reason must not be empty or blank", ErrInvalidArgument)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	now := w.now()
+
+	p, ok := w.policies[policyID]
+	if !ok {
+		return PolicyView{}, fmt.Errorf("%w: %s", ErrPolicyNotFound, policyID)
+	}
+
+	if err := w.checkPayerLocked(p, sessionID, deviceID, now); err != nil {
+		return PolicyView{}, err
+	}
+
+	if p.disabled {
+		if p.disableReason == trimmed {
+			return p.view(), nil
+		}
+		return PolicyView{}, fmt.Errorf("%w: policy %s already disabled with a different reason", ErrConflict, policyID)
+	}
+
+	p.disabled = true
+	p.disabledAt = now
+	p.disabledBy = p.payerAccountID
+	p.disableReason = trimmed
+
+	w.ledger = append(w.ledger, LedgerEntry{
+		Kind:      LedgerPolicyDisabled,
+		AccountID: p.payerAccountID,
+		PolicyID:  p.id,
+		Reason:    trimmed,
+		At:        now,
+	})
+
+	// 停用立即生效：未到等待期限的待审批请求转为拒绝终态，已到或超过
+	// 等待期限的转为过期终态。
+	for _, req := range w.requests {
+		if req.policyID != p.id || req.state != RequestPendingApproval {
+			continue
+		}
+		if now.Before(req.waitDeadline) {
+			req.state = RequestRejected
+			req.rejectReason = fmt.Sprintf("policy %s disabled: %s", p.id, trimmed)
+			req.decidedAt = now
+			w.ledger = append(w.ledger, LedgerEntry{
+				Kind:      LedgerRejection,
+				AccountID: req.accountID,
+				PolicyID:  p.id,
+				RequestID: req.requestID,
+				Reason:    req.rejectReason,
+				At:        now,
+			})
+		} else {
+			req.state = RequestExpired
+			req.decidedAt = now
+			w.ledger = append(w.ledger, LedgerEntry{
+				Kind:      LedgerExpiration,
+				AccountID: req.accountID,
+				PolicyID:  p.id,
+				RequestID: req.requestID,
+				Reason:    "approval period expired",
+				At:        now,
+			})
+		}
+	}
+
+	return p.view(), nil
+}
+
+// checkPayerLocked 在持锁状态下校验停用会话：必须存在、归属策略的出资
+// 账户、绑定当前设备、未吊销且未过期。任一不满足都返回 ErrNotPayer，
+// 且不改变策略、请求或账本。必须在持锁状态下调用。
+func (w *Wallet) checkPayerLocked(p *policy, sessionID, deviceID string, now time.Time) error {
+	sess, ok := w.sessions[sessionID]
+	if !ok {
+		return fmt.Errorf("%w: session %s", ErrNotPayer, sessionID)
+	}
+	if sess.accountID != p.payerAccountID {
+		return fmt.Errorf("%w: session %s belongs to account %s, not payer %s", ErrNotPayer, sess.id, sess.accountID, p.payerAccountID)
+	}
+	if sess.deviceID != deviceID {
+		return fmt.Errorf("%w: session %s is bound to device %s, not %s", ErrNotPayer, sess.id, sess.deviceID, deviceID)
+	}
+	if sess.revoked {
+		return fmt.Errorf("%w: session %s revoked", ErrNotPayer, sess.id)
+	}
+	if !now.Before(sess.expiresAt) {
+		return fmt.Errorf("%w: session %s expired at %s", ErrNotPayer, sess.id, sess.expiresAt.Format(time.RFC3339))
+	}
+	return nil
+}
+
 // Apply 提交一笔代付申请。
 //
 // 校验顺序为：申请字段 -> 使用账户 -> 会话（存在性、归属、设备、吊销、
@@ -354,6 +476,9 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	p, ok := w.policies[in.PolicyID]
 	if !ok {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: %s", ErrPolicyNotFound, in.PolicyID))
+	}
+	if p.disabled {
+		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: policy %s is disabled: %s", ErrPolicyDisabled, p.id, p.disableReason))
 	}
 	if _, ok := p.allowedAccounts[in.AccountID]; !ok {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: account %s is not allowed by policy %s", ErrPolicyDenied, in.AccountID, p.id))
@@ -819,6 +944,7 @@ func (w *Wallet) appendRejection(in RequestInput, at time.Time, cause error) {
 	w.ledger = append(w.ledger, LedgerEntry{
 		Kind:      LedgerRejection,
 		AccountID: in.AccountID,
+		PolicyID:  in.PolicyID,
 		RequestID: in.RequestID,
 		Reason:    cause.Error(),
 		At:        at,
@@ -872,6 +998,10 @@ func (p *policy) view() PolicyView {
 		},
 		ReservedTotal: p.reservedTotal,
 		SpentTotal:    p.spentTotal,
+		Disabled:      p.disabled,
+		DisabledAt:    p.disabledAt,
+		DisabledBy:    p.disabledBy,
+		DisableReason: p.disableReason,
 	}
 }
 

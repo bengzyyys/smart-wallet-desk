@@ -55,6 +55,11 @@ var (
 	// ErrNotApprover 审批会话不属于出资账户、设备不符、已过期或已吊销，
 	// 调用方无权审批该请求。
 	ErrNotApprover = errors.New("wallet: not authorized to approve this request")
+	// ErrNotPayer 停用会话不属于出资账户、设备不符、已吊销或已到期，
+	// 调用方无权停用该策略。
+	ErrNotPayer = errors.New("wallet: not authorized as payer to disable this policy")
+	// ErrPolicyDisabled 策略已被出资账户主动停用，不再受理新的代付申请。
+	ErrPolicyDisabled = errors.New("wallet: policy is disabled")
 	// ErrApprovalExpired 待审批已超过等待期限，不能再批准。
 	ErrApprovalExpired = errors.New("wallet: approval period expired")
 	// ErrRequestNotPending 请求不处于待审批状态，不能批准或拒绝。

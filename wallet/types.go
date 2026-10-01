@@ -75,6 +75,15 @@ type PolicyView struct {
 	ReservedTotal int64
 	// SpentTotal 为已结算扣除的累计费用。
 	SpentTotal int64
+	// Disabled 表示策略是否已被出资账户主动停用。新保存的策略默认未停用；
+	// 停用不可撤销。
+	Disabled bool
+	// DisabledAt 为首次停用时间；未停用时为零值。
+	DisabledAt time.Time
+	// DisabledBy 为执行停用的出资账户编号；未停用时为空。
+	DisabledBy string
+	// DisableReason 为首次停用理由（已去掉首尾空白）；未停用时为空。
+	DisableReason string
 }
 
 // RequestState 描述代付请求的生命周期状态。
@@ -162,6 +171,9 @@ const (
 	LedgerCancellation
 	// LedgerExpiration 待审批超过期限未获批准的状态留痕，无金额变动。
 	LedgerExpiration
+	// LedgerPolicyDisabled 出资账户主动停用策略的留痕，无金额变动；
+	// AccountID 为出资账户，PolicyID 为被停用的策略编号。
+	LedgerPolicyDisabled
 )
 
 // LedgerEntry 是一条账本记录。
@@ -172,6 +184,8 @@ type LedgerEntry struct {
 	// 无金额变动的状态记录（待审批、批准、拒绝、取消、过期）中
 	// 为发起申请的使用账户，用于关联使用账户。
 	AccountID string
+	// PolicyID 为关联的策略编号（策略停用记录）；其他记录为空。
+	PolicyID string
 	// RequestID 为关联的代付请求编号。
 	RequestID string
 	// Amount 为金额（最小货币单位，非负）；状态记录为 0。
