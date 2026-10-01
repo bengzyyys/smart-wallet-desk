@@ -56,6 +56,11 @@ type policy struct {
 	approvalWait      time.Duration
 	reservedTotal     int64
 	spentTotal        int64
+
+	deactivated          bool
+	deactivatedAt        time.Time
+	deactivatorAccountID string
+	deactivateReason     string
 }
 
 type request struct {
@@ -292,6 +297,120 @@ func (w *Wallet) Policy(id string) (PolicyView, error) {
 	return p.view(), nil
 }
 
+// DeactivatePolicy 由出资账户主动停用一条代付策略，立即停止该策略继续
+// 受理代付。停用不可撤销。
+//
+// 必须使用该策略出资账户绑定当前设备的有效会话：会话不存在、不属于出资
+// 账户、设备不符、已吊销或已到期时返回 ErrNotPolicyOwner，不改变策略、
+// 请求或账本。策略编号、会话编号、设备缺失，或理由去掉首尾空白后为空，
+// 返回 ErrInvalidArgument。策略不存在返回 ErrPolicyNotFound。保存与比较
+// 理由均使用去掉首尾空白后的内容。
+//
+// 再次停用仍须通过会话校验：理由与首次相同时幂等返回首次结果，理由不同
+// 返回 ErrConflict；两者都不改写首次停用信息，也不增加账本记录。尚未
+// 开始或已经结束的策略也允许停用；停用后该编号不能再保存成新策略。
+//
+// 停用成功时，该策略下未到等待期限的待审批请求立即转为拒绝终态，拒绝
+// 信息说明策略被停用并包含停用理由，决定时间为停用时间；已到（含恰到）
+// 或超过等待期限的待审批请求进入过期终态。两类处理都不冻结余额、不占用
+// 额度，也不产生退款；其他状态的请求与其他策略不受影响。
+func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) (PolicyView, error) {
+	reason = strings.TrimSpace(reason)
+	if policyID == "" || sessionID == "" || deviceID == "" || reason == "" {
+		return PolicyView{}, fmt.Errorf("%w: policy id, session id, device id and reason are required", ErrInvalidArgument)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	p, ok := w.policies[policyID]
+	if !ok {
+		return PolicyView{}, fmt.Errorf("%w: %s", ErrPolicyNotFound, policyID)
+	}
+	now := w.now()
+	if err := w.checkPolicyOwnerLocked(p, sessionID, deviceID, now); err != nil {
+		return PolicyView{}, err
+	}
+
+	if p.deactivated {
+		// 停用不可撤销：理由相同返回首次结果，理由不同返回冲突，
+		// 均不改写首次信息、不增加账本记录。
+		if p.deactivateReason == reason {
+			return p.view(), nil
+		}
+		return PolicyView{}, fmt.Errorf("%w: policy %s was already deactivated with a different reason", ErrConflict, policyID)
+	}
+
+	p.deactivated = true
+	p.deactivatedAt = now
+	p.deactivatorAccountID = p.payerAccountID
+	p.deactivateReason = reason
+
+	w.ledger = append(w.ledger, LedgerEntry{
+		Kind:      LedgerPolicyDeactivation,
+		AccountID: p.payerAccountID,
+		PolicyID:  p.id,
+		Reason:    reason,
+		At:        now,
+	})
+
+	// 停用瞬间结清该策略全部待审批请求：未到等待期限的随停用立即拒绝，
+	// 已到或超过期限的进入过期终态（不能因未被查询过而变成停用拒绝）。
+	for _, req := range w.requests {
+		if req.policyID != p.id || req.state != RequestPendingApproval {
+			continue
+		}
+		if now.Before(req.waitDeadline) {
+			msg := fmt.Sprintf("policy %s deactivated by payer: %s", p.id, reason)
+			req.state = RequestRejected
+			req.rejectReason = msg
+			req.decidedAt = now
+			req.approverAccountID = p.payerAccountID
+			w.ledger = append(w.ledger, LedgerEntry{
+				Kind:      LedgerRejection,
+				AccountID: req.accountID,
+				RequestID: req.requestID,
+				Reason:    msg,
+				At:        now,
+			})
+			continue
+		}
+		req.state = RequestExpired
+		req.decidedAt = now
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerExpiration,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "approval period expired",
+			At:        now,
+		})
+	}
+	return p.view(), nil
+}
+
+// checkPolicyOwnerLocked 在持锁状态下校验停用会话：必须存在、归属策略的
+// 出资账户、绑定当前设备、未吊销且未到期。任一不满足都返回
+// ErrNotPolicyOwner，且不改变策略、请求或账本。
+func (w *Wallet) checkPolicyOwnerLocked(p *policy, sessionID, deviceID string, now time.Time) error {
+	sess, ok := w.sessions[sessionID]
+	if !ok {
+		return fmt.Errorf("%w: session %s", ErrNotPolicyOwner, sessionID)
+	}
+	if sess.accountID != p.payerAccountID {
+		return fmt.Errorf("%w: session %s belongs to account %s, not payer %s", ErrNotPolicyOwner, sess.id, sess.accountID, p.payerAccountID)
+	}
+	if sess.deviceID != deviceID {
+		return fmt.Errorf("%w: session %s is bound to device %s, not %s", ErrNotPolicyOwner, sess.id, sess.deviceID, deviceID)
+	}
+	if sess.revoked {
+		return fmt.Errorf("%w: session %s revoked", ErrNotPolicyOwner, sess.id)
+	}
+	if !now.Before(sess.expiresAt) {
+		return fmt.Errorf("%w: session %s expired at %s", ErrNotPolicyOwner, sess.id, sess.expiresAt.Format(time.RFC3339))
+	}
+	return nil
+}
+
 // Apply 提交一笔代付申请。
 //
 // 校验顺序为：申请字段 -> 使用账户 -> 会话（存在性、归属、设备、吊销、
@@ -354,6 +473,10 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	p, ok := w.policies[in.PolicyID]
 	if !ok {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: %s", ErrPolicyNotFound, in.PolicyID))
+	}
+	// 停用后的策略不再受理新申请；历史请求的幂等查询在上方已先行处理。
+	if p.deactivated {
+		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: policy %s deactivated: %s", ErrPolicyDeactivated, p.id, p.deactivateReason))
 	}
 	if _, ok := p.allowedAccounts[in.AccountID]; !ok {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: account %s is not allowed by policy %s", ErrPolicyDenied, in.AccountID, p.id))
@@ -870,8 +993,12 @@ func (p *policy) view() PolicyView {
 			ApprovalThreshold: p.approvalThreshold,
 			ApprovalWait:      p.approvalWait,
 		},
-		ReservedTotal: p.reservedTotal,
-		SpentTotal:    p.spentTotal,
+		ReservedTotal:        p.reservedTotal,
+		SpentTotal:           p.spentTotal,
+		Deactivated:          p.deactivated,
+		DeactivatedAt:        p.deactivatedAt,
+		DeactivatorAccountID: p.deactivatorAccountID,
+		DeactivateReason:     p.deactivateReason,
 	}
 }
 

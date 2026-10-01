@@ -36,6 +36,11 @@ var (
 	ErrPolicyInvalid = errors.New("wallet: invalid policy")
 	// ErrPolicyDenied 申请不满足策略授权条件（默认拒绝）。
 	ErrPolicyDenied = errors.New("wallet: request denied by policy")
+	// ErrPolicyDeactivated 策略已被出资账户主动停用，不再受理新申请。
+	ErrPolicyDeactivated = errors.New("wallet: policy is deactivated")
+	// ErrNotPolicyOwner 停用会话不存在、不属于该策略的出资账户、设备不符、
+	// 已过期或已吊销，调用方无权停用该策略。
+	ErrNotPolicyOwner = errors.New("wallet: not authorized to deactivate this policy")
 	// ErrInsufficientBalance 出资账户可用余额不足。
 	ErrInsufficientBalance = errors.New("wallet: insufficient available balance")
 	// ErrQuotaExceeded 超出策略单次或累计费用上限。

@@ -75,6 +75,15 @@ type PolicyView struct {
 	ReservedTotal int64
 	// SpentTotal 为已结算扣除的累计费用。
 	SpentTotal int64
+	// Deactivated 表示策略是否已被出资账户主动停用；新保存的策略为 false。
+	// 停用不可撤销，停用后策略不再受理新申请，编号也不能重新保存为新策略。
+	Deactivated bool
+	// DeactivatedAt 为首次停用时间；未停用时为零值。
+	DeactivatedAt time.Time
+	// DeactivatorAccountID 为执行停用的出资账户；未停用时为空。
+	DeactivatorAccountID string
+	// DeactivateReason 为去掉首尾空白后的停用理由；未停用时为空。
+	DeactivateReason string
 }
 
 // RequestState 描述代付请求的生命周期状态。
@@ -90,7 +99,8 @@ const (
 	// RequestPendingApproval 预估费用超过审批门槛，等待出资账户审批；
 	// 此状态不冻结余额、不占用共享累计额度。
 	RequestPendingApproval
-	// RequestRejected 已被拒绝（审批拒绝或申请会话提前吊销），终态。
+	// RequestRejected 已被拒绝（审批拒绝、申请会话提前吊销或策略被停用），
+	// 终态。
 	RequestRejected
 	// RequestExpired 待审批超过等待期限未获批准，终态。
 	RequestExpired
@@ -136,7 +146,7 @@ type RequestView struct {
 	DecidedAt time.Time
 	// ApproverAccountID 为作出批准或拒绝决定的出资账户；未决定时为空。
 	ApproverAccountID string
-	// RejectReason 为拒绝原因（审批拒绝或会话吊销）；未拒绝时为空。
+	// RejectReason 为拒绝原因（审批拒绝、会话吊销或策略停用）；未拒绝时为空。
 	RejectReason string
 }
 
@@ -162,6 +172,9 @@ const (
 	LedgerCancellation
 	// LedgerExpiration 待审批超过期限未获批准的状态留痕，无金额变动。
 	LedgerExpiration
+	// LedgerPolicyDeactivation 策略被出资账户主动停用的留痕，无金额变动；
+	// AccountID 为出资账户，PolicyID 为被停用的策略，RequestID 为空。
+	LedgerPolicyDeactivation
 )
 
 // LedgerEntry 是一条账本记录。
@@ -174,6 +187,9 @@ type LedgerEntry struct {
 	AccountID string
 	// RequestID 为关联的代付请求编号。
 	RequestID string
+	// PolicyID 为关联的策略编号；仅策略停用等不针对具体请求的记录使用，
+	// 其余记录为空（请求记录可用请求上的策略编号关联）。
+	PolicyID string
 	// Amount 为金额（最小货币单位，非负）；状态记录为 0。
 	Amount int64
 	// Reason 为拒绝原因或补充说明。
