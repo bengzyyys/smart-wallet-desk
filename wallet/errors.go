@@ -32,7 +32,7 @@ var (
 	ErrPolicyExists = errors.New("wallet: policy already exists")
 	// ErrPolicyNotFound 策略不存在。
 	ErrPolicyNotFound = errors.New("wallet: policy not found")
-	// ErrPolicyInvalid 策略定义非法（限额、时间窗、账户等）。
+	// ErrPolicyInvalid 策略定义非法（限额、时间窗、账户、审批配置等）。
 	ErrPolicyInvalid = errors.New("wallet: invalid policy")
 	// ErrPolicyDenied 申请不满足策略授权条件（默认拒绝）。
 	ErrPolicyDenied = errors.New("wallet: request denied by policy")
@@ -40,6 +40,15 @@ var (
 	ErrInsufficientBalance = errors.New("wallet: insufficient available balance")
 	// ErrQuotaExceeded 超出策略单次或累计费用上限。
 	ErrQuotaExceeded = errors.New("wallet: policy quota exceeded")
+
+	// ErrApprovalUnauthorized 审批会话无效或不属于绑定当前设备的出资账户。
+	ErrApprovalUnauthorized = errors.New("wallet: not authorized to approve request")
+	// ErrApprovalDeadline 已过等待期限，待审批请求已过期，不能再批准。
+	ErrApprovalDeadline = errors.New("wallet: approval deadline passed")
+	// ErrRequestNotPending 请求不处于待审批状态，不能批准或拒绝。
+	ErrRequestNotPending = errors.New("wallet: request is not pending approval")
+	// ErrRequestNotReserved 请求未处于已预留状态，不能结算或按预留规则取消。
+	ErrRequestNotReserved = errors.New("wallet: request is not reserved")
 
 	// ErrRequestNotFound 请求不存在。
 	ErrRequestNotFound = errors.New("wallet: request not found")

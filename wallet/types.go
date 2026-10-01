@@ -59,6 +59,14 @@ type PolicySpec struct {
 	MaxPerRequest int64
 	// MaxTotal 为所有使用账户共享的累计费用上限，必须为正。
 	MaxTotal int64
+	// ApprovalThreshold 为大额审批门槛，必须不超过 MaxPerRequest。
+	// 为零表示关闭审批，申请通过全部检查后直接预留；为正则预估费用
+	// 严格超过该门槛的申请先进入待审批，由出资账户会话批准或拒绝；
+	// 不允许为负。
+	ApprovalThreshold int64
+	// ApprovalWait 为审批开启时待审批请求的最长等待时长，必须为正；
+	// 审批关闭（ApprovalThreshold 为零）时该字段被忽略。
+	ApprovalWait time.Duration
 }
 
 // PolicyView 是策略的只读视图。
@@ -74,12 +82,21 @@ type PolicyView struct {
 type RequestState int
 
 const (
+	// RequestPendingApproval 已通过会话、授权、余额与全部硬限额检查，
+	// 但预估费用超过审批门槛，等待出资账户批准；此状态不冻结余额、
+	// 不占用共享累计额度。
+	RequestPendingApproval RequestState = iota
 	// RequestReserved 已受理并完成费用预留，等待结算或取消。
-	RequestReserved RequestState = iota
+	RequestReserved
 	// RequestSettled 已按实际费用结算。
 	RequestSettled
-	// RequestCancelled 未结算即取消，预留已全部退回。
+	// RequestCancelled 未结算即取消（已预留的退回全部预留；待审批
+	// 的不涉及任何资金）。
 	RequestCancelled
+	// RequestRejected 待审批请求被出资账户明确拒绝。
+	RequestRejected
+	// RequestExpired 待审批请求在等待期限内未获批准，到达期限即过期。
+	RequestExpired
 )
 
 // RequestInput 是代付申请内容。
@@ -102,6 +119,19 @@ type RequestInput struct {
 	EstimatedFee int64
 }
 
+// ApprovalInput 是批准或拒绝一笔待审批请求所需的身份与理由信息。
+//
+// 批准与拒绝都必须使用策略出资账户绑定当前设备的有效会话：
+// ApproverAccountID 必须是出资账户，SessionID 必须属于该账户且绑定
+// DeviceID，会话未吊销、未到期。Reason 仅拒绝时使用，不能为空或全空白。
+type ApprovalInput struct {
+	ApproverAccountID string
+	SessionID         string
+	DeviceID          string
+	// Reason 为拒绝原因；批准时忽略，拒绝时不能为空或全为空白。
+	Reason string
+}
+
 // RequestView 是代付请求的只读视图。
 type RequestView struct {
 	PolicyID       string
@@ -114,7 +144,16 @@ type RequestView struct {
 	ActualFee      int64
 	State          RequestState
 	CreatedAt      time.Time
-	SettledAt      time.Time
+	// WaitUntil 为待审批请求的等待期限（提交时刻加等待时长、策略结束
+	// 时间与申请会话到期时间三者的最早值）；非待审批产生的请求为零值。
+	WaitUntil time.Time
+	// DecidedAt 为批准或拒绝的决定时间；过期时为流转到过期终态的时间。
+	DecidedAt time.Time
+	// ApproverAccountID 为作出批准/拒绝决定的出资账户。
+	ApproverAccountID string
+	// RejectReason 为拒绝原因；仅拒绝状态下非空。
+	RejectReason string
+	SettledAt    time.Time
 }
 
 // LedgerKind 标识账本记录类型。
@@ -129,17 +168,33 @@ const (
 	LedgerRefund
 	// LedgerRejection 申请被拒绝的留痕，不涉及任何金额变动。
 	LedgerRejection
+	// LedgerPendingApproval 申请进入待审批的留痕，不改变任何金额，
+	// 也不冻结余额或占用共享累计额度。
+	LedgerPendingApproval
+	// LedgerApproval 待审批请求获批准并完成一次性预留的留痕；金额为 0，
+	// 对应的资金变动另记一条 LedgerReserve。
+	LedgerApproval
+	// LedgerApprovalRejected 待审批请求被出资账户拒绝的留痕，不涉及金额。
+	LedgerApprovalRejected
+	// LedgerCancelled 请求被取消的状态留痕，不涉及金额（已预留请求的
+	// 退款另记一条 LedgerRefund）。
+	LedgerCancelled
+	// LedgerExpired 待审批请求到达等待期限未获批准的留痕，不涉及金额。
+	LedgerExpired
 )
 
 // LedgerEntry 是一条账本记录。
 type LedgerEntry struct {
 	// Kind 为记录类型。
 	Kind LedgerKind
-	// AccountID 为资金发生变动的出资账户；拒绝记录中为空。
+	// AccountID 为资金发生变动的出资账户；状态留痕与申请拒绝记录中为空。
 	AccountID string
+	// UsageAccountID 为发起代付申请的使用账户；所有与具体请求关联的
+	// 记录都会填写，便于按使用账户追溯。
+	UsageAccountID string
 	// RequestID 为关联的代付请求编号；拒绝记录也会尽量记录。
 	RequestID string
-	// Amount 为金额（最小货币单位，非负）；拒绝记录为 0。
+	// Amount 为金额（最小货币单位，非负）；不涉及资金的记录为 0。
 	Amount int64
 	// Reason 为拒绝原因或补充说明。
 	Reason string
