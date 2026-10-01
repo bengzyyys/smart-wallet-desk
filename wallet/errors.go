@@ -51,4 +51,15 @@ var (
 	ErrAlreadyCancelled = errors.New("wallet: request already cancelled")
 	// ErrSettleTooLarge 结算实际费用超过预留的预估费用。
 	ErrSettleTooLarge = errors.New("wallet: actual fee exceeds estimated fee")
+
+	// ErrNotApprover 审批会话不属于出资账户、设备不符、已过期或已吊销，
+	// 调用方无权审批该请求。
+	ErrNotApprover = errors.New("wallet: not authorized to approve this request")
+	// ErrApprovalExpired 待审批已超过等待期限，不能再批准。
+	ErrApprovalExpired = errors.New("wallet: approval period expired")
+	// ErrRequestNotPending 请求不处于待审批状态，不能批准或拒绝。
+	ErrRequestNotPending = errors.New("wallet: request is not pending approval")
+	// ErrRequestNotReserved 请求不处于已预留状态，不能结算或（在拒绝、
+	// 过期终态下）取消。
+	ErrRequestNotReserved = errors.New("wallet: request is not reserved")
 )

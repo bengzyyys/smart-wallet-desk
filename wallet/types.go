@@ -59,6 +59,13 @@ type PolicySpec struct {
 	MaxPerRequest int64
 	// MaxTotal 为所有使用账户共享的累计费用上限，必须为正。
 	MaxTotal int64
+	// ApprovalThreshold 为大额审批门槛：预估费用严格超过此值的申请进入
+	// 待审批，由出资账户审批通过后才预留。零表示关闭审批，申请直接预留；
+	// 不得为负，且不得超过单次费用上限。
+	ApprovalThreshold int64
+	// ApprovalWait 为待审批请求的最长等待时长（自提交时刻起算）。
+	// 审批开启（ApprovalThreshold 为正）时必须为正；关闭时忽略。
+	ApprovalWait time.Duration
 }
 
 // PolicyView 是策略的只读视图。
@@ -80,6 +87,13 @@ const (
 	RequestSettled
 	// RequestCancelled 未结算即取消，预留已全部退回。
 	RequestCancelled
+	// RequestPendingApproval 预估费用超过审批门槛，等待出资账户审批；
+	// 此状态不冻结余额、不占用共享累计额度。
+	RequestPendingApproval
+	// RequestRejected 已被拒绝（审批拒绝或申请会话提前吊销），终态。
+	RequestRejected
+	// RequestExpired 待审批超过等待期限未获批准，终态。
+	RequestExpired
 )
 
 // RequestInput 是代付申请内容。
@@ -115,6 +129,15 @@ type RequestView struct {
 	State          RequestState
 	CreatedAt      time.Time
 	SettledAt      time.Time
+	// WaitDeadline 为待审批期限（提交时刻 + 等待时长、策略结束时间、
+	// 申请会话到期时间三者中的最早值）；非待审批请求为零值。
+	WaitDeadline time.Time
+	// DecidedAt 为审批决定时间（批准、拒绝或过期的时刻）；未决定时为零值。
+	DecidedAt time.Time
+	// ApproverAccountID 为作出批准或拒绝决定的出资账户；未决定时为空。
+	ApproverAccountID string
+	// RejectReason 为拒绝原因（审批拒绝或会话吊销）；未拒绝时为空。
+	RejectReason string
 }
 
 // LedgerKind 标识账本记录类型。
@@ -127,19 +150,31 @@ const (
 	LedgerSettle
 	// LedgerRefund 退回：结算差额或取消时退回的预留。
 	LedgerRefund
-	// LedgerRejection 申请被拒绝的留痕，不涉及任何金额变动。
+	// LedgerRejection 申请被拒绝或待审批被拒的留痕，不涉及任何金额变动。
 	LedgerRejection
+	// LedgerPendingApproval 申请进入待审批的状态留痕，无金额变动。
+	LedgerPendingApproval
+	// LedgerApproval 待审批被批准的状态留痕，无金额变动；批准带来的
+	// 预留另记 LedgerReserve。
+	LedgerApproval
+	// LedgerCancellation 待审批请求被取消的状态留痕，无金额变动
+	// （已预留请求的取消仍记 LedgerRefund）。
+	LedgerCancellation
+	// LedgerExpiration 待审批超过期限未获批准的状态留痕，无金额变动。
+	LedgerExpiration
 )
 
 // LedgerEntry 是一条账本记录。
 type LedgerEntry struct {
 	// Kind 为记录类型。
 	Kind LedgerKind
-	// AccountID 为资金发生变动的出资账户；拒绝记录中为空。
+	// AccountID 为资金发生变动的出资账户（预留、扣减、退回）；
+	// 无金额变动的状态记录（待审批、批准、拒绝、取消、过期）中
+	// 为发起申请的使用账户，用于关联使用账户。
 	AccountID string
-	// RequestID 为关联的代付请求编号；拒绝记录也会尽量记录。
+	// RequestID 为关联的代付请求编号。
 	RequestID string
-	// Amount 为金额（最小货币单位，非负）；拒绝记录为 0。
+	// Amount 为金额（最小货币单位，非负）；状态记录为 0。
 	Amount int64
 	// Reason 为拒绝原因或补充说明。
 	Reason string
