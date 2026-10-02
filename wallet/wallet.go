@@ -927,6 +927,31 @@ func (w *Wallet) refreshReservedLocked(req *request, now time.Time) {
 	w.expireReservationLocked(req, req.reserveDeadline)
 }
 
+// expirePendingApprovalsLocked 惰性结清当前全部已到等待期限（含到期时刻）
+// 的待审批请求，使它们进入过期终态并留下状态记录。按等待截止时刻顺序
+// 处理（同截止时刻按使用账户、请求编号排序），保证账本追加顺序确定。
+// 必须在持锁状态下调用。
+func (w *Wallet) expirePendingApprovalsLocked(now time.Time) {
+	due := make([]*request, 0)
+	for _, req := range w.requests {
+		if req.state == RequestPendingApproval && !now.Before(req.waitDeadline) {
+			due = append(due, req)
+		}
+	}
+	sort.SliceStable(due, func(i, j int) bool {
+		if due[i].waitDeadline.Equal(due[j].waitDeadline) {
+			if due[i].accountID != due[j].accountID {
+				return due[i].accountID < due[j].accountID
+			}
+			return due[i].requestID < due[j].requestID
+		}
+		return due[i].waitDeadline.Before(due[j].waitDeadline)
+	})
+	for _, req := range due {
+		w.refreshPendingLocked(req, now)
+	}
+}
+
 // expireReservationsLocked 惰性结清当前全部已到期（含到期时刻）的预留。
 // 所有账户/余额/策略/请求/账本查询以及新申请、批准的资金检查入口都先调用
 // 它，因此调用者无须逐笔取消即可看到已到期预留的释放结果。释放时间一律
