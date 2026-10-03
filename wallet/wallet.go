@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -564,10 +565,11 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	// 资金与额度检查前释放所有已到期预留（含同一出资账户在其他策略下的
 	// 预留），因此先查余额还是先申请看到的可用金额都一致。
 	w.expireReservationsLocked(now)
-	// 预留中的费用同样占用共享累计额度。
-	if p.reservedTotal+p.spentTotal+in.EstimatedFee > p.maxTotal {
+	// 预留中的费用同样占用共享累计额度。各金额分别合法但合计越过 int64
+	// 范围时也算超额，不能让相加回绕成小数而绕过累计上限。
+	if used, exceeded := quotaExceededLocked(p, in.EstimatedFee); exceeded {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
-			ErrQuotaExceeded, in.EstimatedFee, p.maxTotal, p.reservedTotal+p.spentTotal))
+			ErrQuotaExceeded, in.EstimatedFee, p.maxTotal, used))
 	}
 
 	payer, ok := w.accounts[p.payerAccountID]
@@ -820,9 +822,9 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 		if payer.available < req.estimatedFee {
 			return RequestView{}, fmt.Errorf("%w: payer %s available %d, need %d", ErrInsufficientBalance, payer.id, payer.available, req.estimatedFee)
 		}
-		if p.reservedTotal+p.spentTotal+req.estimatedFee > p.maxTotal {
+		if used, exceeded := quotaExceededLocked(p, req.estimatedFee); exceeded {
 			return RequestView{}, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
-				ErrQuotaExceeded, req.estimatedFee, p.maxTotal, p.reservedTotal+p.spentTotal)
+				ErrQuotaExceeded, req.estimatedFee, p.maxTotal, used)
 		}
 		// 一次性预留全部预估费用。
 		payer.available -= req.estimatedFee
@@ -1122,6 +1124,30 @@ func (w *Wallet) lookupRequest(accountID, requestID string) (*request, *policy, 
 		return nil, nil, fmt.Errorf("%w: account %s request %s", ErrRequestNotFound, accountID, requestID)
 	}
 	return req, w.policies[req.policyID], nil
+}
+
+// quotaExceededLocked 在持锁状态下判断把 fee 计入策略共享累计额度后是否
+// 严格超过累计上限：共享累计额度按“当前预留费用 + 已结算实际费用 + 本次
+// 预估费用”计算。各金额本身都是 int64 范围内的合法值，但合计可能越过
+// int64 上限；相加一旦溢出就视为超额，不能让回绕成负数的结果绕过累计
+// 上限。返回的 used 为计入本次费用前（溢出时为展示用的 math.MaxInt64）
+// 的已占用额度，便于错误信息说明。必须在持锁状态下、且已先释放到期预留
+// 后调用。
+func quotaExceededLocked(p *policy, fee int64) (used int64, exceeded bool) {
+	used, ok := addInt64(p.reservedTotal, p.spentTotal)
+	if !ok {
+		// 现存预留与已花费自身合计已越过 int64，必然超过任何 int64 上限。
+		return math.MaxInt64, true
+	}
+	total, ok := addInt64(used, fee)
+	if !ok {
+		// 计入本次费用后越过 int64 上限，而累计上限至多为 MaxInt64，属超额。
+		return math.MaxInt64, true
+	}
+	if total > p.maxTotal {
+		return used, true
+	}
+	return total, false
 }
 
 // reject 记录无需持锁快速校验阶段的拒绝（当前没有此类调用，保留对称接口）。
