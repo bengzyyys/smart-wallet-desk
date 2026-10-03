@@ -1311,7 +1311,13 @@ func buildCumulativeQuotaBackup(t *testing.T, t0 time.Time, policies []quotaPoli
 				}
 			}
 			if rs.state == RequestSettled {
-				r.SettledAt = timeJSON(time.Time(r.ReservedAt).Add(ps.reserveDur))
+				// 结算必须发生在有效预留期内：启用超时时取预留窗口中点（严格
+				// 早于截止时刻）；关闭超时时在预留完成时刻结算即合法。
+				if ps.reserveDur > 0 {
+					r.SettledAt = timeJSON(time.Time(r.ReservedAt).Add(ps.reserveDur / 2))
+				} else {
+					r.SettledAt = r.ReservedAt
+				}
 			}
 			if rs.state == RequestReservationExpired {
 				r.ReserveExpiredAt = r.ReserveDeadline

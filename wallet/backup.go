@@ -323,6 +323,14 @@ func addInt64(sum, x int64) (int64, bool) {
 // 接受，恰到截止时刻批准必须拒绝）；该核对只针对备份记载的批准历史，
 // 不以恢复时的当前时间替代批准时间，因此期限内已批准的请求即使恢复时
 // 等待期限、申请会话或策略时间窗均已结束也照常恢复，不重新计时。
+// 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
+// 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
+// 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
+// 费用为零也不例外）；时间按备份保存的完整绝对时刻比较，纳秒与时区表示均
+// 不改变结论，关闭预留超时的请求不设此项期限。该核对同样只看备份记载的
+// 预留与结算时刻，与恢复时的当前时间无关：期限内完成的结算即使很久以后恢复
+// 仍保持已结算，余额、策略已花费总额与既有账本原样保留，不追加退款或超时
+// 记录。
 // 任一策略现存预留费用与已结算实际费用的合计严格超过其
 // 共享累计上限时同样拒绝（同一策略的多个使用账户合并计算，不同策略分别
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
@@ -775,6 +783,27 @@ func validateReserveTiming(r *request) error {
 	return nil
 }
 
+// validateSettlementTiming 校验已结算请求的结算时刻必须是正常结算能够产生的
+// 历史：不早于实际预留时刻（恰在预留完成时结算可以接受）；当请求启用了预留
+// 超时（reserveDuration>0，此时 reserveDeadline 已由 validateReserveTiming
+// 确认为 reservedAt+duration）时，还必须严格早于预留截止时刻——恰到截止时刻
+// 及之后预留已按超时规则全额退回，任何结算（含实际费用为零）都不可能成功。
+//
+// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal/Before）：
+// 纳秒精度保留，截止前不足一秒的合法结算不会被当成超时；不同时区表示的同一
+// 时刻判定相同。关闭预留超时（reserveDuration==0）时没有截止时刻，沿用原有
+// 结算规则、不人为增加期限。该校验只针对备份记载的预留与结算时刻，与恢复时
+// 的当前时间无关：期限内完成的结算在很久以后恢复仍是已结算。
+func validateSettlementTiming(r *request) error {
+	if r.settledAt.Before(r.reservedAt) {
+		return fmt.Errorf("settled_at %v is before reserved_at %v", r.settledAt, r.reservedAt)
+	}
+	if r.reserveDuration > 0 && !r.settledAt.Before(r.reserveDeadline) {
+		return fmt.Errorf("settled_at %v is not within the valid reserve window ending strictly before reserve deadline %v", r.settledAt, r.reserveDeadline)
+	}
+	return nil
+}
+
 // validateRequestTimingAndState 校验请求状态与其计时/金额字段自洽，并与
 // 不可变的策略条件、申请会话保持一致，防止任意状态搭配任意时间戳的损坏
 // 备份。sess 为该请求的申请会话。
@@ -852,10 +881,11 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if !r.reserveExpiredAt.IsZero() {
 			return errors.New("settled request must not carry reserve-expired time")
 		}
-		if r.settledAt.Before(r.reservedAt) {
-			return errors.New("settled_at is before reserved_at")
-		}
 		if err := validateReserveTiming(r); err != nil {
+			return err
+		}
+		// 结算时刻必须落在有效预留期内：启用预留超时时严格早于截止时刻。
+		if err := validateSettlementTiming(r); err != nil {
 			return err
 		}
 		if r.rejectReason != "" {

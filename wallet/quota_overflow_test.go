@@ -222,7 +222,8 @@ func buildApproveOverflowBackup(t *testing.T, t0 time.Time, reserveDur time.Dura
 		State:      int(RequestSettled),
 		CreatedAt:  timeJSON(t0.Add(-2 * time.Hour)),
 		ReservedAt: timeJSON(t0.Add(-2 * time.Hour)),
-		SettledAt:  timeJSON(t0.Add(-time.Hour)),
+		// 恰在预留完成时结算：无论是否启用预留超时都落在有效预留期起点，合法。
+		SettledAt: timeJSON(t0.Add(-2 * time.Hour)),
 	}
 	big := requestBackupV1{
 		PolicyID: "p-big", RequestID: "big", AccountID: "u2", PayerAccountID: "payer",
