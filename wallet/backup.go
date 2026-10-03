@@ -315,7 +315,12 @@ func addInt64(sum, x int64) (int64, bool) {
 // 账本类型、非法金额或策略参数、悬空引用、申请会话不属于使用账户、
 // 请求出资账户与策略不符，或余额/累计金额与请求求和不一致（含求和超出
 // int64 范围），都返回包装了具体原因的 ErrBackupInvalid，绝不会返回
-// 部分恢复的钱包。任一账户的可用余额加上该账户在所有策略下仍处于已预留
+// 部分恢复的钱包。任一策略的预留总额与已花费总额之和（当前预留中的费用
+// 与已结算的实际费用共同占用共享累计额度）严格超过其累计上限时同样拒绝，
+// 两项合计超出 int64 范围也按超限处理；合计恰好等于上限合法。该校验针对
+// 备份保存的资金占用状态，在恢复时的到期自动退回之前完成：即使某笔已预留
+// 请求在恢复时已经到期、按正常规则将全额退回，也不能先退回再让原本超额的
+// 备份通过。任一账户的可用余额加上该账户在所有策略下仍处于已预留
 // 状态的费用之和超出 int64 上限时同样拒绝（即使各请求、各策略金额分别
 // 合法）：否则取消或预留超时的退回会使余额越界；校验在恢复时的到期
 // 自动退回之前完成，预留尚未到期也当场拒绝。恢复出的钱包与原钱包、同一
@@ -611,6 +616,25 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		}
 		if got, want := p.spentTotal, spentSumByPolicy[id]; got != want {
 			return fmt.Errorf("%w: policy %q spent total %d != sum of settled requests %d", ErrBackupInvalid, id, got, want)
+		}
+	}
+
+	// ---- 策略预留总额 + 已花费总额 不得超过累计上限 ----
+	// 与 Apply/Approve 的受理口径一致：当前预留中的费用与已结算的实际费用
+	// 共同占用共享累计额度。即使账户预留余额、策略两项总额分别与请求求和
+	// 一致，合计仍可能早已越限；这样的备份恢复出来就是一条已超额的策略，
+	// 必须整体拒绝。按策略逐条判断：同一策略的多个使用账户共同计入，出资
+	// 账户相同的不同策略不合并。合计超出 int64 上限同样拒绝（两项金额各自
+	// 合法但合计越界时不能误判为额度充足）；合计恰好等于上限合法。本检查
+	// 针对备份保存的资金占用状态，必须在恢复时的到期自动退回之前完成：
+	// 恢复即超时退款的备份也不能借此蒙混过关。
+	for id, p := range policyByID {
+		total, ok := addInt64(p.reservedTotal, p.spentTotal)
+		if !ok {
+			return fmt.Errorf("%w: policy %q reserved total %d plus spent total %d overflows int64 (cumulative limit %d)", ErrBackupInvalid, id, p.reservedTotal, p.spentTotal, p.maxTotal)
+		}
+		if total > p.maxTotal {
+			return fmt.Errorf("%w: policy %q reserved total %d plus spent total %d exceeds cumulative limit %d", ErrBackupInvalid, id, p.reservedTotal, p.spentTotal, p.maxTotal)
 		}
 	}
 

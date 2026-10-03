@@ -1204,6 +1204,250 @@ func TestRestoreAcceptsAvailablePlusReservedAtBoundary(t *testing.T) {
 	}
 }
 
+// quotaBackupPolicy 描述 buildQuotaBackup 中一条策略及其请求。
+type quotaBackupPolicy struct {
+	id         string
+	maxTotal   int64
+	reserved   []int64    // 仍处于已预留状态的请求预估费用（占用额度）
+	settled    [][2]int64 // 已结算请求的 {预估费用, 实际费用}（实际费用占用额度）
+	cancelled  []int64    // 已预留后取消的请求预估费用（不再占用）
+	pending    []int64    // 待审批请求的预估费用（不冻结、不占用）
+	reserveDur time.Duration
+}
+
+// buildQuotaBackup 构造一个资金求和自洽的备份：payer 出资，u1/u2 为使用
+// 账户；每条策略按 quotaBackupPolicy 携带请求，账户预留余额与策略预留/
+// 已花费总额均由请求求和得出，因此求和核对必然通过，唯一可能越界的是
+// 策略累计额度。reserveDur>0 时已预留请求的截止时刻为 t0+reserveDur，
+// 便于验证“恢复时即到期”的情形。
+func buildQuotaBackup(t *testing.T, t0 time.Time, policies ...quotaBackupPolicy) []byte {
+	t.Helper()
+	b := backupV1{
+		Version:    backupVersion,
+		ExportedAt: timeJSON(t0),
+		Accounts: []accountBackupV1{
+			{ID: "payer", CreatedAt: timeJSON(t0)},
+			{ID: "u1", CreatedAt: timeJSON(t0)},
+			{ID: "u2", CreatedAt: timeJSON(t0)},
+		},
+		Sessions: []sessionBackupV1{
+			{ID: "s1", AccountID: "u1", DeviceID: "d1", ExpiresAt: timeJSON(t0.Add(time.Hour)), CreatedAt: timeJSON(t0)},
+			{ID: "s2", AccountID: "u2", DeviceID: "d2", ExpiresAt: timeJSON(t0.Add(time.Hour)), CreatedAt: timeJSON(t0)},
+		},
+		Ledger: []ledgerEntryBackupV1{},
+	}
+	var accountReserved int64
+	for _, qp := range policies {
+		// 有待审批请求时开启审批（门槛 1），其余请求一律直接受理或经批准预留。
+		threshold := int64(0)
+		var approvalWait time.Duration
+		if len(qp.pending) > 0 {
+			threshold = 1
+			approvalWait = 5 * time.Minute
+		}
+		p := policyBackupV1{
+			ID: qp.id, PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
+			Operation: "charge", Payee: "shop",
+			StartsAt: timeJSON(t0.Add(-time.Hour)), EndsAt: timeJSON(t0.Add(time.Hour)),
+			MaxPerRequest:      math.MaxInt64,
+			MaxTotal:           qp.maxTotal,
+			ApprovalThreshold:  threshold,
+			ApprovalWait:       durationJSON(approvalWait),
+			MaxReserveDuration: durationJSON(qp.reserveDur),
+		}
+		seq := 0
+		mk := func(state RequestState, acct string, est, act int64) requestBackupV1 {
+			seq++
+			sess := "s1"
+			if acct == "u2" {
+				sess = "s2"
+			}
+			return requestBackupV1{
+				PolicyID: qp.id, RequestID: fmt.Sprintf("%s-r%d", qp.id, seq),
+				AccountID: acct, PayerAccountID: "payer", SessionID: sess,
+				Operation: "charge", Payee: "shop",
+				EstimatedFee: est, ActualFee: act, State: int(state),
+				CreatedAt: timeJSON(t0),
+			}
+		}
+		reserve := func(r *requestBackupV1) {
+			r.ReservedAt = timeJSON(t0)
+			r.ReserveDuration = durationJSON(qp.reserveDur)
+			if qp.reserveDur > 0 {
+				r.ReserveDeadline = timeJSON(t0.Add(qp.reserveDur))
+			}
+			if threshold > 0 && r.EstimatedFee > threshold {
+				r.ApproverAccountID = "payer"
+				r.DecidedAt = timeJSON(t0)
+			}
+		}
+		for i, fee := range qp.reserved {
+			acct := "u1"
+			if i%2 == 1 {
+				acct = "u2"
+			}
+			r := mk(RequestReserved, acct, fee, 0)
+			reserve(&r)
+			b.Requests = append(b.Requests, r)
+			p.ReservedTotal += fee
+			accountReserved += fee
+		}
+		for _, pair := range qp.settled {
+			r := mk(RequestSettled, "u1", pair[0], pair[1])
+			reserve(&r)
+			r.SettledAt = timeJSON(t0)
+			b.Requests = append(b.Requests, r)
+			p.SpentTotal += pair[1]
+		}
+		for _, fee := range qp.cancelled {
+			r := mk(RequestCancelled, "u1", fee, 0)
+			reserve(&r)
+			b.Requests = append(b.Requests, r)
+		}
+		for _, fee := range qp.pending {
+			r := mk(RequestPendingApproval, "u1", fee, 0)
+			r.WaitDeadline = timeJSON(t0.Add(approvalWait))
+			b.Requests = append(b.Requests, r)
+		}
+		b.Policies = append(b.Policies, p)
+	}
+	b.Accounts[0].Reserved = accountReserved
+	data, err := json.Marshal(&b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestRestoreRejectsPolicyCumulativeLimitExceeded 验证策略预留总额与已花费
+// 总额合计严格超过累计上限的备份必须被拒绝：账户预留余额、策略两项总额
+// 与请求求和全部一致也不能放行；合计超出 int64 上限同样按超限拒绝。
+// 错误必须可识别为 ErrBackupInvalid，并指出策略编号与累计额度超限。
+func TestRestoreRejectsPolicyCumulativeLimitExceeded(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		policies  []quotaBackupPolicy
+		restoreAt time.Time
+		wantID    string // 错误必须指出的策略编号
+		wantMsg   string
+	}{
+		{
+			// 任务示例：上限 50，已结算 30 + 已预留 30 = 60。
+			name:      "reserved plus spent exceeds limit",
+			policies:  []quotaBackupPolicy{{id: "p", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{30, 30}}}},
+			restoreAt: t0,
+			wantID:    "p", wantMsg: "cumulative limit",
+		},
+		{
+			// 同一策略的多个使用账户共同计入同一累计额度。
+			name:      "usage accounts share one policy limit",
+			policies:  []quotaBackupPolicy{{id: "p", maxTotal: 50, reserved: []int64{20, 20}, settled: [][2]int64{{20, 20}}}},
+			restoreAt: t0,
+			wantID:    "p", wantMsg: "cumulative limit",
+		},
+		{
+			// 两项金额各自合法，合计越过 int64 上限：不能误判为额度充足。
+			name:      "reserved plus spent overflows int64",
+			policies:  []quotaBackupPolicy{{id: "p", maxTotal: math.MaxInt64, reserved: []int64{math.MaxInt64}, settled: [][2]int64{{1, 1}}}},
+			restoreAt: t0,
+			wantID:    "p", wantMsg: "overflows int64",
+		},
+		{
+			// 恢复时预留已到期、按正常规则将全额退回：仍按备份保存的
+			// 占用状态判断，不能先退回再放行。
+			name:      "reservation due at restore time still occupies",
+			policies:  []quotaBackupPolicy{{id: "p", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{30, 30}}, reserveDur: time.Minute}},
+			restoreAt: t0.Add(30 * time.Minute),
+			wantID:    "p", wantMsg: "cumulative limit",
+		},
+		{
+			// 多条策略各自判断：p1 合法不免除 p2 的超额。
+			name: "second policy over limit",
+			policies: []quotaBackupPolicy{
+				{id: "p1", maxTotal: 50, reserved: []int64{10}},
+				{id: "p2", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{30, 30}}},
+			},
+			restoreAt: t0,
+			wantID:    "p2", wantMsg: "cumulative limit",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildQuotaBackup(t, t0, tc.policies...)
+			w2, err := restoreAt(data, tc.restoreAt)
+			if err == nil || w2 != nil {
+				t.Fatalf("over-limit backup restored: w2=%v err=%v", w2, err)
+			}
+			if !errors.Is(err, ErrBackupInvalid) {
+				t.Fatalf("err = %v, want ErrBackupInvalid", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, `"`+tc.wantID+`"`) || !strings.Contains(msg, tc.wantMsg) {
+				t.Fatalf("error %q must name policy %q and mention %q", msg, tc.wantID, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// TestRestoreAcceptsPolicyCumulativeLimitAtBoundary 验证合计恰好等于累计
+// 上限（含上限为 int64 最大值）仍属合法；结算退回的差额、已取消与待审批
+// 请求不占用额度；出资账户相同的不同策略不合并额度。
+func TestRestoreAcceptsPolicyCumulativeLimitAtBoundary(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 合计恰好等于上限：30 预留 + 30 已花费 = 60。
+	data := buildQuotaBackup(t, t0, quotaBackupPolicy{
+		id: "p", maxTotal: 60, reserved: []int64{30}, settled: [][2]int64{{30, 30}},
+	})
+	w2, err := restoreAt(data, t0)
+	if err != nil {
+		t.Fatalf("boundary restore: %v", err)
+	}
+	if v, err := w2.Policy("p"); err != nil || v.ReservedTotal != 30 || v.SpentTotal != 30 {
+		t.Fatalf("policy view = %+v err = %v, want reserved 30 spent 30", v, err)
+	}
+
+	// 上限恰为 int64 最大值，合计恰好等于上限。
+	data = buildQuotaBackup(t, t0, quotaBackupPolicy{
+		id: "p", maxTotal: math.MaxInt64, reserved: []int64{math.MaxInt64 - 1}, settled: [][2]int64{{1, 1}},
+	})
+	w2, err = restoreAt(data, t0)
+	if err != nil {
+		t.Fatalf("max-int64 boundary restore: %v", err)
+	}
+	if v, err := w2.Policy("p"); err != nil || v.ReservedTotal != math.MaxInt64-1 || v.SpentTotal != 1 {
+		t.Fatalf("policy view = %+v err = %v, want reserved MaxInt64-1 spent 1", v, err)
+	}
+
+	// 结算退回的差额不计入已花费：预估 30 实结 20，30 预留 + 20 实结 = 50。
+	data = buildQuotaBackup(t, t0, quotaBackupPolicy{
+		id: "p", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{30, 20}},
+	})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("settled refund difference must not occupy: %v", err)
+	}
+
+	// 已取消与待审批请求不占用额度：30 预留 + 20 实结 = 50，取消的 40 与
+	// 待审批的 30 若被计入将远超上限。
+	data = buildQuotaBackup(t, t0, quotaBackupPolicy{
+		id: "p", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{20, 20}},
+		cancelled: []int64{40}, pending: []int64{30},
+	})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("cancelled/pending requests must not occupy: %v", err)
+	}
+
+	// 出资账户相同的不同策略分别判断：两条策略各占 50（恰为上限），
+	// 合并视角的 100 不影响恢复。
+	data = buildQuotaBackup(t, t0,
+		quotaBackupPolicy{id: "p1", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{20, 20}}},
+		quotaBackupPolicy{id: "p2", maxTotal: 50, reserved: []int64{30}, settled: [][2]int64{{20, 20}}},
+	)
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("policies with the same payer must be judged separately: %v", err)
+	}
+}
+
 // ---- 并发 ----
 
 func TestExportConcurrentWithMutations(t *testing.T) {
