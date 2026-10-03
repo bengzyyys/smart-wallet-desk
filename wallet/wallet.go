@@ -565,9 +565,9 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	// 预留），因此先查余额还是先申请看到的可用金额都一致。
 	w.expireReservationsLocked(now)
 	// 预留中的费用同样占用共享累计额度。
-	if p.reservedTotal+p.spentTotal+in.EstimatedFee > p.maxTotal {
+	if used, exceed := quotaWouldExceedLocked(p, in.EstimatedFee); exceed {
 		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
-			ErrQuotaExceeded, in.EstimatedFee, p.maxTotal, p.reservedTotal+p.spentTotal))
+			ErrQuotaExceeded, in.EstimatedFee, p.maxTotal, used))
 	}
 
 	payer, ok := w.accounts[p.payerAccountID]
@@ -820,9 +820,9 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 		if payer.available < req.estimatedFee {
 			return RequestView{}, fmt.Errorf("%w: payer %s available %d, need %d", ErrInsufficientBalance, payer.id, payer.available, req.estimatedFee)
 		}
-		if p.reservedTotal+p.spentTotal+req.estimatedFee > p.maxTotal {
+		if used, exceed := quotaWouldExceedLocked(p, req.estimatedFee); exceed {
 			return RequestView{}, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
-				ErrQuotaExceeded, req.estimatedFee, p.maxTotal, p.reservedTotal+p.spentTotal)
+				ErrQuotaExceeded, req.estimatedFee, p.maxTotal, used)
 		}
 		// 一次性预留全部预估费用。
 		payer.available -= req.estimatedFee
@@ -1064,6 +1064,24 @@ func withReserveTimingLocked(req *request, p *policy, reservedAt time.Time) {
 	if p.maxReserveDuration > 0 {
 		req.reserveDeadline = reservedAt.Add(p.maxReserveDuration)
 	}
+}
+
+// quotaWouldExceedLocked 判断在策略 p 上再计入 fee 后，共享累计合计是否
+// 严格超过累计上限，并返回计入前“现存预留 + 已结算实际费用”的合计（用于
+// 错误信息；该合计本身越过 int64 范围时返回 0）。现存预留、已结算实际费用
+// 与本次费用各自合法、但合计越过 int64 范围时 exceed 同样为 true：不能让
+// 求和回绕成小（或负）数后被当成额度充足。累计上限与单次上限仍允许取
+// int64 最大值，这里不缩小金额范围。必须在持锁状态下调用。
+func quotaWouldExceedLocked(p *policy, fee int64) (used int64, exceed bool) {
+	used, ok := addInt64(p.reservedTotal, p.spentTotal)
+	if !ok {
+		return 0, true
+	}
+	total, ok := addInt64(used, fee)
+	if !ok {
+		return used, true
+	}
+	return used, total > p.maxTotal
 }
 
 // Request 查询某使用账户下的代付请求。待审批请求到期即转为过期终态，
