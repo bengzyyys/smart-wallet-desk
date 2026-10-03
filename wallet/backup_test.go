@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1022,6 +1023,184 @@ func TestRestoreRejectsInt64Overflow(t *testing.T) {
 		t.Fatal("overflow backup restored")
 	} else if !errors.Is(err, ErrBackupInvalid) {
 		t.Fatalf("overflow err = %v, want ErrBackupInvalid", err)
+	}
+}
+
+// buildRefundOverflowBackup 构造一个自洽备份：出资账户 payer 的可用余额为
+// available，fees 为“策略编号 -> 一笔仍处于已预留状态的请求费用”映射
+// （每策略一笔，便于验证跨策略合计）。reserveDur 为这些预留的最长预留
+// 时长（零表示关闭超时）；账户/策略的预留总额按 fees 自洽填写。
+func buildRefundOverflowBackup(t *testing.T, t0 time.Time, available int64, reserveDur time.Duration, fees map[string]int64) []byte {
+	t.Helper()
+	b := backupV1{
+		Version:    backupVersion,
+		ExportedAt: timeJSON(t0),
+		Accounts: []accountBackupV1{
+			{ID: "payer", Available: available, Reserved: 0, CreatedAt: timeJSON(t0)},
+			{ID: "u1", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+		},
+		Sessions: []sessionBackupV1{
+			{ID: "s1", AccountID: "u1", DeviceID: "d1", ExpiresAt: timeJSON(t0.Add(time.Hour)), CreatedAt: timeJSON(t0)},
+		},
+		Policies: make([]policyBackupV1, 0, len(fees)),
+		Requests: make([]requestBackupV1, 0, len(fees)),
+		Ledger:   []ledgerEntryBackupV1{},
+	}
+	var reservedTotal int64
+	pids := make([]string, 0, len(fees))
+	for pid := range fees {
+		pids = append(pids, pid)
+	}
+	sort.Strings(pids)
+	for _, pid := range pids {
+		fee := fees[pid]
+		b.Policies = append(b.Policies, policyBackupV1{
+			ID: pid, PayerAccountID: "payer", AllowedAccountIDs: []string{"u1"},
+			Operation: "charge", Payee: "shop",
+			StartsAt: timeJSON(t0.Add(-time.Hour)), EndsAt: timeJSON(t0.Add(time.Hour)),
+			MaxPerRequest:      math.MaxInt64,
+			MaxTotal:           math.MaxInt64,
+			MaxReserveDuration: durationJSON(reserveDur),
+			ReservedTotal:      fee,
+		})
+		r := requestBackupV1{
+			PolicyID: pid, RequestID: "req-" + pid, AccountID: "u1", PayerAccountID: "payer",
+			SessionID: "s1", Operation: "charge", Payee: "shop",
+			EstimatedFee:    fee,
+			State:           int(RequestReserved),
+			CreatedAt:       timeJSON(t0),
+			ReservedAt:      timeJSON(t0),
+			ReserveDuration: durationJSON(reserveDur),
+		}
+		if reserveDur > 0 {
+			r.ReserveDeadline = timeJSON(t0.Add(reserveDur))
+		}
+		b.Requests = append(b.Requests, r)
+		sum, ok := addInt64(reservedTotal, fee)
+		if !ok {
+			t.Fatalf("test setup reserved total overflow")
+		}
+		reservedTotal = sum
+	}
+	for i := range b.Accounts {
+		if b.Accounts[i].ID == "payer" {
+			b.Accounts[i].Reserved = reservedTotal
+		}
+	}
+	data, err := json.Marshal(&b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestRestoreRejectsAvailablePlusReservedOverflow 验证可用余额与现存预留
+// 合计越过 int64 上限的备份必须被拒绝——即使各请求与策略金额分别合法。
+func TestRestoreRejectsAvailablePlusReservedOverflow(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name       string
+		fees       map[string]int64
+		available  int64
+		reserveDur time.Duration
+		restoreAt  time.Time
+	}{
+		{
+			name:      "max available plus one reserved, not yet due",
+			fees:      map[string]int64{"p": 1},
+			available: math.MaxInt64,
+			restoreAt: t0,
+		},
+		{
+			name:       "max available plus one reserved, due at restore time",
+			fees:       map[string]int64{"p": 1},
+			available:  math.MaxInt64,
+			reserveDur: time.Minute,
+			restoreAt:  t0.Add(30 * time.Minute),
+		},
+		{
+			name:      "cross-policy reserved sum pushes total over max",
+			fees:      map[string]int64{"p1": 1, "p2": 1},
+			available: math.MaxInt64 - 1,
+			restoreAt: t0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildRefundOverflowBackup(t, t0, tc.available, tc.reserveDur, tc.fees)
+			w2, err := restoreAt(data, tc.restoreAt)
+			if err == nil {
+				if w2 != nil {
+					t.Fatalf("overflow backup restored a wallet")
+				}
+				t.Fatalf("overflow backup restored without error")
+			}
+			if !errors.Is(err, ErrBackupInvalid) {
+				t.Fatalf("err = %v, want ErrBackupInvalid", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "payer") || !strings.Contains(msg, "overflows int64") {
+				t.Fatalf("error %q must name account and the overflow", msg)
+			}
+		})
+	}
+}
+
+// TestRestoreAcceptsAvailablePlusReservedAtBoundary 验证合计恰好等于上限
+// 仍然合法：取消或超时退回后可用余额恰好为 MaxInt64；预留为零而可用
+// 余额等于上限也能恢复。
+func TestRestoreAcceptsAvailablePlusReservedAtBoundary(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 可用 = 上限-1，预留 1（未启用超时）：恢复后取消得到上限。
+	data := buildRefundOverflowBackup(t, t0, math.MaxInt64-1, 0, map[string]int64{"p": 1})
+	w2, err := restoreAt(data, t0)
+	if err != nil {
+		t.Fatalf("boundary restore: %v", err)
+	}
+	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: math.MaxInt64 - 1, Reserved: 1}) {
+		t.Fatalf("boundary balance = %+v", bal)
+	}
+	if _, err := w2.Cancel("u1", "req-p"); err != nil {
+		t.Fatalf("cancel boundary reservation: %v", err)
+	}
+	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+		t.Fatalf("balance after cancel = %+v, want available MaxInt64", bal)
+	}
+
+	// 跨两笔策略的预留合计恰为 2：可用 = 上限-2，逐笔取消后得到上限。
+	data = buildRefundOverflowBackup(t, t0, math.MaxInt64-2, 0, map[string]int64{"p1": 1, "p2": 1})
+	w2, err = restoreAt(data, t0)
+	if err != nil {
+		t.Fatalf("cross-policy boundary restore: %v", err)
+	}
+	for _, rid := range []string{"req-p1", "req-p2"} {
+		if _, err := w2.Cancel("u1", rid); err != nil {
+			t.Fatalf("cancel %s: %v", rid, err)
+		}
+	}
+	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+		t.Fatalf("balance after cancelling both = %+v, want available MaxInt64", bal)
+	}
+
+	// 恢复时预留恰好超时：自动退回 1 后可用余额恰好为上限，不留负数。
+	data = buildRefundOverflowBackup(t, t0, math.MaxInt64-1, time.Minute, map[string]int64{"p": 1})
+	w2, err = restoreAt(data, t0.Add(30*time.Minute))
+	if err != nil {
+		t.Fatalf("boundary timeout restore: %v", err)
+	}
+	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+		t.Fatalf("balance after timeout restore = %+v, want available MaxInt64", bal)
+	}
+	r, err := w2.Request("u1", "req-p")
+	if err != nil || r.State != RequestReservationExpired {
+		t.Fatalf("request state = %v err = %v, want reservation expired", r.State, err)
+	}
+
+	// 预留为零、可用余额等于上限：直接恢复。
+	data = buildRefundOverflowBackup(t, t0, math.MaxInt64, 0, map[string]int64{})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("max available with no reserved: %v", err)
 	}
 }
 

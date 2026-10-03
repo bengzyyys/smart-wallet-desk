@@ -315,8 +315,11 @@ func addInt64(sum, x int64) (int64, bool) {
 // 账本类型、非法金额或策略参数、悬空引用、申请会话不属于使用账户、
 // 请求出资账户与策略不符，或余额/累计金额与请求求和不一致（含求和超出
 // int64 范围），都返回包装了具体原因的 ErrBackupInvalid，绝不会返回
-// 部分恢复的钱包。恢复出的钱包与原钱包、同一备份恢复出的其他钱包互不
-// 影响。
+// 部分恢复的钱包。任一账户的可用余额加上该账户在所有策略下仍处于已预留
+// 状态的费用之和超出 int64 上限时同样拒绝（即使各请求、各策略金额分别
+// 合法）：否则取消或预留超时的退回会使余额越界；校验在恢复时的到期
+// 自动退回之前完成，预留尚未到期也当场拒绝。恢复出的钱包与原钱包、同一
+// 备份恢复出的其他钱包互不影响。
 func Restore(data []byte) (*Wallet, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, fmt.Errorf("%w: empty backup", ErrBackupInvalid)
@@ -585,6 +588,19 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 	for id, acc := range w.accounts {
 		if got, want := acc.reserved, reservedByAccount[id]; got != want {
 			return fmt.Errorf("%w: account %q reserved %d != sum of reserved requests %d", ErrBackupInvalid, id, got, want)
+		}
+	}
+
+	// ---- 可用余额 + 现存预留不得超过 int64 上限 ----
+	// 取消或预留超时会把预留全额退回可用余额：合计一旦超出 MaxInt64，
+	// 退回时余额就会越界变负。reservedByAccount 按出资账户汇总该账户在
+	// 所有策略下仍处于已预留状态的费用（待审批不冻结费用，已结算、已取消、
+	// 已预留超时的费用不再占用预留，故均不计入）。本检查必须在恢复时的
+	// 到期自动退回之前完成，使“恢复即超时退款”的备份也不能蒙混过关；
+	// 合计恰好等于上限合法（随后退回恰好得到上限金额）。
+	for id, acc := range w.accounts {
+		if _, ok := addInt64(acc.available, reservedByAccount[id]); !ok {
+			return fmt.Errorf("%w: account %q available %d plus reserved %d overflows int64", ErrBackupInvalid, id, acc.available, reservedByAccount[id])
 		}
 	}
 
