@@ -1204,6 +1204,383 @@ func TestRestoreAcceptsAvailablePlusReservedAtBoundary(t *testing.T) {
 	}
 }
 
+// ---- 策略共享累计额度 ----
+
+// quotaReqSpec 描述累计额度测试备份中的一条请求。
+type quotaReqSpec struct {
+	id           string
+	account      string // "u1" 或 "u2"
+	estFee       int64
+	actualFee    int64
+	state        RequestState
+	due          bool   // 已预留请求的截止时刻是否早于恢复时刻 t0
+	wasReserved  bool   // RequestCancelled 时标识“已预留后取消”
+	rejectReason string // RequestRejected 使用
+}
+
+// quotaPolicySpec 描述一条策略及其请求。
+type quotaPolicySpec struct {
+	id                    string
+	per, total, threshold int64
+	wait, reserveDur      time.Duration
+	reqs                  []quotaReqSpec
+}
+
+// buildCumulativeQuotaBackup 构造资金完全自洽的备份：账户预留余额、各策略
+// 预留/已花费总额均按“现存已预留请求的预估费用”和“已结算请求的实际费用”
+// 求和填写，因此余额与各项总额核对必然通过，能否恢复只取决于累计额度判断。
+func buildCumulativeQuotaBackup(t *testing.T, t0 time.Time, policies []quotaPolicySpec) []byte {
+	t.Helper()
+	b := backupV1{
+		Version:    backupVersion,
+		ExportedAt: timeJSON(t0),
+		Accounts: []accountBackupV1{
+			{ID: "payer", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+			{ID: "u1", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+			{ID: "u2", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+		},
+		Sessions: []sessionBackupV1{
+			{ID: "s1", AccountID: "u1", DeviceID: "d1", ExpiresAt: timeJSON(t0.Add(24 * time.Hour)), CreatedAt: timeJSON(t0)},
+			{ID: "s2", AccountID: "u2", DeviceID: "d2", ExpiresAt: timeJSON(t0.Add(24 * time.Hour)), CreatedAt: timeJSON(t0)},
+		},
+		Policies: make([]policyBackupV1, 0, len(policies)),
+		Requests: make([]requestBackupV1, 0),
+		Ledger:   []ledgerEntryBackupV1{},
+	}
+	sessionOf := map[string]string{"u1": "s1", "u2": "s2"}
+
+	var accountReserved int64
+	for _, ps := range policies {
+		var reservedTotal, spentTotal int64
+		b.Policies = append(b.Policies, policyBackupV1{
+			ID: ps.id, PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
+			Operation: "charge", Payee: "shop",
+			StartsAt: timeJSON(t0.Add(-time.Hour)), EndsAt: timeJSON(t0.Add(24 * time.Hour)),
+			MaxPerRequest:      ps.per,
+			MaxTotal:           ps.total,
+			ApprovalThreshold:  ps.threshold,
+			ApprovalWait:       durationJSON(ps.wait),
+			MaxReserveDuration: durationJSON(ps.reserveDur),
+		})
+		for _, rs := range ps.reqs {
+			r := requestBackupV1{
+				PolicyID: ps.id, RequestID: rs.id, AccountID: rs.account, PayerAccountID: "payer",
+				SessionID: sessionOf[rs.account], Operation: "charge", Payee: "shop",
+				EstimatedFee: rs.estFee, ActualFee: rs.actualFee,
+				State:     int(rs.state),
+				CreatedAt: timeJSON(t0),
+			}
+			reservedOrigin := rs.state == RequestReserved || rs.state == RequestSettled ||
+				rs.state == RequestReservationExpired ||
+				(rs.state == RequestCancelled && rs.wasReserved)
+			switch rs.state {
+			case RequestPendingApproval, RequestRejected, RequestExpired:
+				r.WaitDeadline = timeJSON(t0.Add(ps.wait))
+			case RequestCancelled:
+				if !reservedOrigin {
+					r.DecidedAt = timeJSON(t0)
+				}
+			}
+			if rs.state == RequestRejected {
+				r.DecidedAt = timeJSON(t0)
+				r.RejectReason = rs.rejectReason
+			}
+			if rs.state == RequestExpired {
+				r.DecidedAt = timeJSON(t0.Add(ps.wait))
+			}
+			if reservedOrigin {
+				reservedAt := t0
+				if rs.due || rs.state == RequestReservationExpired {
+					reservedAt = t0.Add(-2 * ps.reserveDur)
+				}
+				r.ReservedAt = timeJSON(reservedAt)
+				r.ReserveDuration = durationJSON(ps.reserveDur)
+				if ps.reserveDur > 0 {
+					r.ReserveDeadline = timeJSON(reservedAt.Add(ps.reserveDur))
+				}
+				if ps.threshold > 0 && rs.estFee > ps.threshold {
+					r.ApproverAccountID = "payer"
+					r.DecidedAt = timeJSON(reservedAt)
+				}
+			}
+			if rs.state == RequestSettled {
+				r.SettledAt = timeJSON(time.Time(r.ReservedAt).Add(ps.reserveDur))
+			}
+			if rs.state == RequestReservationExpired {
+				r.ReserveExpiredAt = r.ReserveDeadline
+			}
+			b.Requests = append(b.Requests, r)
+
+			switch rs.state {
+			case RequestReserved:
+				sum, ok := addInt64(reservedTotal, rs.estFee)
+				if !ok {
+					t.Fatalf("test setup: reserved sum overflow")
+				}
+				reservedTotal = sum
+				sum, ok = addInt64(accountReserved, rs.estFee)
+				if !ok {
+					t.Fatalf("test setup: account reserved overflow")
+				}
+				accountReserved = sum
+			case RequestSettled:
+				sum, ok := addInt64(spentTotal, rs.actualFee)
+				if !ok {
+					t.Fatalf("test setup: spent sum overflow")
+				}
+				spentTotal = sum
+			}
+		}
+		for i := range b.Policies {
+			if b.Policies[i].ID == ps.id {
+				b.Policies[i].ReservedTotal = reservedTotal
+				b.Policies[i].SpentTotal = spentTotal
+			}
+		}
+	}
+	for i := range b.Accounts {
+		if b.Accounts[i].ID == "payer" {
+			b.Accounts[i].Reserved = accountReserved
+		}
+	}
+	data, err := json.Marshal(&b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestRestoreRejectsPolicyCumulativeQuotaExceeded 验证：即使账户预留余额、
+// 策略预留总额与已花费总额分别与请求求和一致，任一策略“现存预留 + 已结算
+// 实际费用”严格超过共享累计上限时，整个备份必须被拒绝。
+func TestRestoreRejectsPolicyCumulativeQuotaExceeded(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name       string
+		policies   []quotaPolicySpec
+		restoreAt  time.Time
+		wantPolicy string
+	}{
+		{
+			name: "settled 30 plus reserved 30 over total 50",
+			policies: []quotaPolicySpec{{
+				id: "p-over", per: 30, total: 50,
+				reqs: []quotaReqSpec{
+					{id: "settled", account: "u1", estFee: 30, actualFee: 30, state: RequestSettled},
+					{id: "reserved", account: "u1", estFee: 30, state: RequestReserved},
+				},
+			}},
+			restoreAt:  t0,
+			wantPolicy: "p-over",
+		},
+		{
+			name: "shared across usage accounts",
+			policies: []quotaPolicySpec{{
+				id: "p-shared", per: 30, total: 50,
+				reqs: []quotaReqSpec{
+					{id: "by-u1", account: "u1", estFee: 30, actualFee: 30, state: RequestSettled},
+					{id: "by-u2", account: "u2", estFee: 30, state: RequestReserved},
+				},
+			}},
+			restoreAt:  t0,
+			wantPolicy: "p-shared",
+		},
+		{
+			name: "reserved already due at restore is still counted",
+			policies: []quotaPolicySpec{{
+				id: "p-due", per: 30, total: 50, reserveDur: time.Minute,
+				reqs: []quotaReqSpec{
+					{id: "settled", account: "u1", estFee: 30, actualFee: 30, state: RequestSettled},
+					{id: "reserved-due", account: "u1", estFee: 30, state: RequestReserved, due: true},
+				},
+			}},
+			// 恢复时该预留已过截止时刻，按正常规则将全额退回，但仍须先拒绝。
+			restoreAt:  t0,
+			wantPolicy: "p-due",
+		},
+		{
+			name: "second policy over limit is named",
+			policies: []quotaPolicySpec{
+				{
+					id: "p1", per: 100, total: 50,
+					reqs: []quotaReqSpec{
+						{id: "s1", account: "u1", estFee: 30, actualFee: 20, state: RequestSettled},
+						{id: "r1", account: "u1", estFee: 30, state: RequestReserved},
+					},
+				},
+				{
+					id: "p2", per: 100, total: 50,
+					reqs: []quotaReqSpec{
+						{id: "s2", account: "u1", estFee: 30, actualFee: 21, state: RequestSettled},
+						{id: "r2", account: "u1", estFee: 30, state: RequestReserved},
+					},
+				},
+			},
+			restoreAt:  t0,
+			wantPolicy: "p2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildCumulativeQuotaBackup(t, t0, tc.policies)
+			w2, err := restoreAt(data, tc.restoreAt)
+			if err == nil {
+				if w2 != nil {
+					t.Fatalf("over-quota backup restored a wallet")
+				}
+				t.Fatalf("over-quota backup restored without error")
+			}
+			if !errors.Is(err, ErrBackupInvalid) {
+				t.Fatalf("err = %v, want ErrBackupInvalid", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.wantPolicy) {
+				t.Fatalf("error %q must name policy %q", msg, tc.wantPolicy)
+			}
+			if !strings.Contains(msg, "cumulative total limit") {
+				t.Fatalf("error %q must explain the cumulative total limit", msg)
+			}
+		})
+	}
+}
+
+// TestRestoreRejectsPolicyCumulativeQuotaOverflow 验证预留与已花费各自都能
+// 由 int64 表示、合计却越过 int64 上限时必须拒绝，不能因金额越界误判为
+// 额度充足。
+func TestRestoreRejectsPolicyCumulativeQuotaOverflow(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-big", per: math.MaxInt64, total: math.MaxInt64,
+		reqs: []quotaReqSpec{
+			{id: "settled", account: "u1", estFee: math.MaxInt64, actualFee: math.MaxInt64, state: RequestSettled},
+			{id: "reserved", account: "u1", estFee: 1, state: RequestReserved},
+		},
+	}})
+	w2, err := restoreAt(data, t0)
+	if err == nil {
+		if w2 != nil {
+			t.Fatalf("overflowing-quota backup restored a wallet")
+		}
+		t.Fatalf("overflowing-quota backup restored without error")
+	}
+	if !errors.Is(err, ErrBackupInvalid) {
+		t.Fatalf("err = %v, want ErrBackupInvalid", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "p-big") || !strings.Contains(msg, "cumulative total limit") {
+		t.Fatalf("error %q must name policy and cumulative limit", msg)
+	}
+}
+
+// TestRestoreAcceptsCumulativeQuotaAtBoundary 验证合计恰好等于累计上限合法，
+// 包括上限恰为 int64 最大值的情况；不缩小现有金额范围。
+func TestRestoreAcceptsCumulativeQuotaAtBoundary(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 上限 50：结算实际 20（预估 30，差额已退回）+ 现存预留 30 = 50。
+	data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-eq", per: 30, total: 50,
+		reqs: []quotaReqSpec{
+			{id: "settled", account: "u1", estFee: 30, actualFee: 20, state: RequestSettled},
+			{id: "reserved", account: "u1", estFee: 30, state: RequestReserved},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("used == total restore: %v", err)
+	}
+
+	// 上限 MaxInt64：已花费 MaxInt64-1 + 预留 1 = MaxInt64。
+	data = buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-max", per: math.MaxInt64, total: math.MaxInt64,
+		reqs: []quotaReqSpec{
+			{id: "settled", account: "u1", estFee: math.MaxInt64, actualFee: math.MaxInt64 - 1, state: RequestSettled},
+			{id: "reserved", account: "u1", estFee: 1, state: RequestReserved},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("used == MaxInt64 restore: %v", err)
+	}
+
+	// 上限 MaxInt64：单笔已结算实际费用 MaxInt64，占满额度。
+	data = buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-spent-max", per: math.MaxInt64, total: math.MaxInt64,
+		reqs: []quotaReqSpec{
+			{id: "settled", account: "u1", estFee: math.MaxInt64, actualFee: math.MaxInt64, state: RequestSettled},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("spent == MaxInt64 restore: %v", err)
+	}
+
+	// 上限 MaxInt64：单笔预估费用 MaxInt64 的现存预留占满额度。
+	data = buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-reserved-max", per: math.MaxInt64, total: math.MaxInt64,
+		reqs: []quotaReqSpec{
+			{id: "reserved", account: "u1", estFee: math.MaxInt64, state: RequestReserved},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("reserved == MaxInt64 restore: %v", err)
+	}
+
+	// 不同策略分别判断：同一出资账户的两条策略各自恰好占满 50，
+	// 跨策略合计 100 不影响合法性。
+	data = buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{
+		{
+			id: "p1", per: 100, total: 50,
+			reqs: []quotaReqSpec{
+				{id: "s1", account: "u1", estFee: 30, actualFee: 20, state: RequestSettled},
+				{id: "r1", account: "u1", estFee: 30, state: RequestReserved},
+			},
+		},
+		{
+			id: "p2", per: 100, total: 50,
+			reqs: []quotaReqSpec{
+				{id: "s2", account: "u2", estFee: 30, actualFee: 20, state: RequestSettled},
+				{id: "r2", account: "u2", estFee: 30, state: RequestReserved},
+			},
+		},
+	})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("two policies each at their own limit: %v", err)
+	}
+}
+
+// TestRestoreCumulativeQuotaIgnoresNonOccupyingStates 验证只有现存预留与已
+// 结算实际费用占用累计额度：待审批、审批拒绝、待审批取消、待审批过期、已
+// 预留后取消、预留超时的请求都不占用；结算退回的差额也不计入已花费。
+func TestRestoreCumulativeQuotaIgnoresNonOccupyingStates(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	// 累计上限仅 10：一笔实际费用 10 的已结算请求占满额度；其余请求费用均
+	// 为 30（待审批系严格超过门槛 10），但都不占用额度，备份仍合法。
+	data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-free", per: 100, total: 10, threshold: 10,
+		wait: 5 * time.Minute, reserveDur: time.Minute,
+		reqs: []quotaReqSpec{
+			{id: "settled", account: "u1", estFee: 10, actualFee: 10, state: RequestSettled},
+			{id: "reserved-cancelled", account: "u1", estFee: 10, state: RequestCancelled, wasReserved: true},
+			{id: "reservation-expired", account: "u1", estFee: 10, state: RequestReservationExpired},
+			{id: "pending", account: "u1", estFee: 30, state: RequestPendingApproval},
+			{id: "rejected", account: "u1", estFee: 30, state: RequestRejected, rejectReason: "no"},
+			{id: "pending-expired", account: "u1", estFee: 30, state: RequestExpired},
+			{id: "pending-cancelled", account: "u1", estFee: 30, state: RequestCancelled},
+		},
+	}})
+	w2, err := restoreAt(data, t0)
+	if err != nil {
+		t.Fatalf("non-counting states restore: %v", err)
+	}
+	// 未到期的待审批请求不被改写；没有任何现存预留，账户预留余额为零。
+	r, err := w2.Request("u1", "pending")
+	if err != nil || r.State != RequestPendingApproval {
+		t.Fatalf("pending request state = %v err = %v, want still pending", r.State, err)
+	}
+	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: 0, Reserved: 0}) {
+		t.Fatalf("payer balance = %+v, want zero reserved", bal)
+	}
+}
+
 // ---- 并发 ----
 
 func TestExportConcurrentWithMutations(t *testing.T) {
