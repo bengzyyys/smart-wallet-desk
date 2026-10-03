@@ -323,6 +323,16 @@ func addInt64(sum, x int64) (int64, bool) {
 // 接受，恰到截止时刻批准必须拒绝）；该核对只针对备份记载的批准历史，
 // 不以恢复时的当前时间替代批准时间，因此期限内已批准的请求即使恢复时
 // 等待期限、申请会话或策略时间窗均已结束也照常恢复，不重新计时。
+// 已结算请求在其实际启用预留超时（预留时长为正）时，结算时刻还必须落在
+// 有效预留期内：不早于实际预留时刻（直接受理为受理时刻，审批路径为批准
+// 成功时刻，等待审批的时间不计入），且严格早于预留截止时刻——恰在预留
+// 完成时结算可以接受，恰到截止时刻或更晚的结算在正常流程中不可能发生
+// （截止时刻及之后预留已按超时规则全额退回），实际费用为零同样受限；
+// 比较依据备份保存的完整时刻。关闭预留超时的请求不增加结算期限。该核对
+// 同样只看备份记载的时间：期限内已完成的结算即使恢复时预留早已超时、
+// 申请会话已到期或被吊销、策略已结束或被停用，也保持已结算终态，实际
+// 费用、结算时间、余额、策略已花费总额与既有账本原样保留，不追加退款
+// 或超时记录。
 // 任一策略现存预留费用与已结算实际费用的合计严格超过其
 // 共享累计上限时同样拒绝（同一策略的多个使用账户合并计算，不同策略分别
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
@@ -857,6 +867,13 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		}
 		if err := validateReserveTiming(r); err != nil {
 			return err
+		}
+		// 启用预留超时时，结算必须落在有效预留期 [reserved_at, reserve_deadline)
+		// 内：恰在预留完成时结算可以接受，恰到截止时刻及之后预留已按超时规则
+		// 全额退回，正常流程不可能再产生结算（实际费用为零也遵守该限制）。
+		// 关闭预留超时（时长为零）的请求不增加结算期限。
+		if r.reserveDuration > 0 && !r.settledAt.Before(r.reserveDeadline) {
+			return fmt.Errorf("settled_at %v is not within the valid reservation period [reserved_at %v, reserve deadline %v)", r.settledAt, r.reservedAt, r.reserveDeadline)
 		}
 		if r.rejectReason != "" {
 			return errors.New("settled request must not carry a reject reason")

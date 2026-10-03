@@ -1311,7 +1311,8 @@ func buildCumulativeQuotaBackup(t *testing.T, t0 time.Time, policies []quotaPoli
 				}
 			}
 			if rs.state == RequestSettled {
-				r.SettledAt = timeJSON(time.Time(r.ReservedAt).Add(ps.reserveDur))
+				// 恰在预留完成时结算：启用预留超时时必须严格早于截止时刻。
+				r.SettledAt = r.ReservedAt
 			}
 			if rs.state == RequestReservationExpired {
 				r.ReserveExpiredAt = r.ReserveDeadline
