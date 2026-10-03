@@ -149,7 +149,9 @@ type RequestView struct {
 	CreatedAt      time.Time
 	SettledAt      time.Time
 	// WaitDeadline 为待审批期限（提交时刻 + 等待时长、策略结束时间、
-	// 申请会话到期时间三者中的最早值）；非待审批请求为零值。
+	// 申请会话到期时间三者中的最早值）；所有走过审批流程的请求（待审批、
+	// 被拒、过期、待审批取消及超门槛经批准后预留）保留该时刻，未超门槛
+	// 直接预留的请求为零值。
 	WaitDeadline time.Time
 	// ReservedAt 为费用实际预留完成的时刻：直接受理的请求为受理时刻，
 	// 批准后预留的请求为批准成功时刻。从未预留（待审批、被拒、待审批过期、

@@ -1263,12 +1263,19 @@ func buildCumulativeQuotaBackup(t *testing.T, t0 time.Time, policies []quotaPoli
 			MaxReserveDuration: durationJSON(ps.reserveDur),
 		})
 		for _, rs := range ps.reqs {
+			// 待审批系请求统一提交于 t0；发生过预留的“到期”请求（恢复时已到
+			// 预留截止或已预留超时）提交与预留时刻前移，保证预留时刻不会早于
+			// 提交时刻。
+			createdAt := t0
+			if (rs.state == RequestReserved && rs.due) || rs.state == RequestReservationExpired {
+				createdAt = t0.Add(-2 * ps.reserveDur)
+			}
 			r := requestBackupV1{
 				PolicyID: ps.id, RequestID: rs.id, AccountID: rs.account, PayerAccountID: "payer",
 				SessionID: sessionOf[rs.account], Operation: "charge", Payee: "shop",
 				EstimatedFee: rs.estFee, ActualFee: rs.actualFee,
 				State:     int(rs.state),
-				CreatedAt: timeJSON(t0),
+				CreatedAt: timeJSON(createdAt),
 			}
 			reservedOrigin := rs.state == RequestReserved || rs.state == RequestSettled ||
 				rs.state == RequestReservationExpired ||
@@ -1289,18 +1296,18 @@ func buildCumulativeQuotaBackup(t *testing.T, t0 time.Time, policies []quotaPoli
 				r.DecidedAt = timeJSON(t0.Add(ps.wait))
 			}
 			if reservedOrigin {
-				reservedAt := t0
-				if rs.due || rs.state == RequestReservationExpired {
-					reservedAt = t0.Add(-2 * ps.reserveDur)
-				}
+				reservedAt := createdAt
 				r.ReservedAt = timeJSON(reservedAt)
 				r.ReserveDuration = durationJSON(ps.reserveDur)
 				if ps.reserveDur > 0 {
 					r.ReserveDeadline = timeJSON(reservedAt.Add(ps.reserveDur))
 				}
 				if ps.threshold > 0 && rs.estFee > ps.threshold {
+					// 批准路径：批准（预留）时刻不早于提交时刻、严格早于等待
+					// 截止时刻，等待截止与三者最早值一致。
 					r.ApproverAccountID = "payer"
 					r.DecidedAt = timeJSON(reservedAt)
+					r.WaitDeadline = timeJSON(createdAt.Add(ps.wait))
 				}
 			}
 			if rs.state == RequestSettled {

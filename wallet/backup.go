@@ -315,7 +315,15 @@ func addInt64(sum, x int64) (int64, bool) {
 // 账本类型、非法金额或策略参数、悬空引用、申请会话不属于使用账户、
 // 请求出资账户与策略不符，或余额/累计金额与请求求和不一致（含求和超出
 // int64 范围），都返回包装了具体原因的 ErrBackupInvalid，绝不会返回
-// 部分恢复的钱包。任一策略现存预留费用与已结算实际费用的合计严格超过其
+// 部分恢复的钱包。曾经批准成功并实际预留费用的超门槛请求（恢复时仍为
+// 已预留，或后来已结算、已取消、已预留超时）还必须通过审批时限核对：
+// 保存的等待截止时刻必须与提交时刻加策略等待时长、策略结束时间、申请
+// 会话到期时间三者的最早值一致（缺失、提前、推迟都拒绝），且批准决定
+// 必须发生在提交时刻及之后、等待截止时刻之前（恰在提交时刻批准可以
+// 接受，恰到截止时刻批准必须拒绝）；该核对只针对备份记载的批准历史，
+// 不以恢复时的当前时间替代批准时间，因此期限内已批准的请求即使恢复时
+// 等待期限、申请会话或策略时间窗均已结束也照常恢复，不重新计时。
+// 任一策略现存预留费用与已结算实际费用的合计严格超过其
 // 共享累计上限时同样拒绝（同一策略的多个使用账户合并计算，不同策略分别
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
 // 该检查针对备份保存的资金占用状态、在恢复时的到期自动退回之前完成：
@@ -798,7 +806,7 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	switch r.state {
 	case RequestReserved, RequestSettled, RequestReservationExpired:
 		// 这三类一定发生过预留。
-		if err := validateReservedOrigin(r, p, approvalRequired, reservedOrigin); err != nil {
+		if err := validateReservedOrigin(r, p, sess, approvalRequired, reservedOrigin); err != nil {
 			return err
 		}
 	case RequestPendingApproval, RequestRejected, RequestExpired:
@@ -809,7 +817,7 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	case RequestCancelled:
 		// 取消可能来自待审批（从未预留）或已预留。
 		if reservedOrigin {
-			if err := validateReservedOrigin(r, p, approvalRequired, true); err != nil {
+			if err := validateReservedOrigin(r, p, sess, approvalRequired, true); err != nil {
 				return err
 			}
 		} else {
@@ -888,15 +896,8 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if r.rejectReason != "" {
 			return errors.New("pending request must not carry a reject reason")
 		}
-		want := r.createdAt.Add(p.approvalWait)
-		if p.endsAt.Before(want) {
-			want = p.endsAt
-		}
-		if sess.expiresAt.Before(want) {
-			want = sess.expiresAt
-		}
-		if !r.waitDeadline.Equal(want) {
-			return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+		if !r.waitDeadline.Equal(expectedWaitDeadline(r, p, sess)) {
+			return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, expectedWaitDeadline(r, p, sess))
 		}
 	case RequestRejected:
 		if r.decidedAt.IsZero() || r.rejectReason == "" {
@@ -933,12 +934,53 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	return nil
 }
 
+// expectedWaitDeadline 计算审批路径请求的等待截止时刻：提交时刻 + 策略
+// 等待时长、策略结束时间、申请会话到期时间三者中的最早值。待审批与已批准
+// 预留的请求保存的等待截止时刻都必须与该值一致。
+func expectedWaitDeadline(r *request, p *policy, sess *session) time.Time {
+	want := r.createdAt.Add(p.approvalWait)
+	if p.endsAt.Before(want) {
+		want = p.endsAt
+	}
+	if sess.expiresAt.Before(want) {
+		want = sess.expiresAt
+	}
+	return want
+}
+
+// validateApprovalTiming 校验“经批准后预留”的请求保存的等待期限与批准
+// 时刻自洽，防止备份中的资金占用绕过正常审批等待期限：
+//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
+//     申请会话到期时间三者的最早值，提前或推迟都拒绝；
+//   - 批准（决定/预留）时刻必须不早于提交时刻（恰在提交时刻批准可以接受），
+//     且严格早于等待截止时刻：恰到截止时刻的批准在正常审批中不可能发生
+//     （截止时刻及之后请求只能进入待审批过期终态）。
+//
+// 该校验只针对备份记载的批准历史，与恢复时的当前时间无关：期限内已批准的
+// 请求在恢复时即使等待期限、申请会话或策略时间窗均已结束也照常恢复。
+func validateApprovalTiming(r *request, p *policy, sess *session) error {
+	if r.waitDeadline.IsZero() {
+		return errors.New("approved request missing wait deadline")
+	}
+	want := expectedWaitDeadline(r, p, sess)
+	if !r.waitDeadline.Equal(want) {
+		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+	}
+	if r.decidedAt.Before(r.createdAt) {
+		return fmt.Errorf("approval decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
+	}
+	if !r.decidedAt.Before(r.waitDeadline) {
+		return fmt.Errorf("approval decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
+	}
+	return nil
+}
+
 // validateReservedOrigin 校验“发生过预留”的请求：预留计时字段必须齐全、
-// 预留时长快照必须与策略一致，且审批路径（批准人、决定时间）与费用/门槛
-// 相匹配。对所有发生过预留的状态（已预留、已结算、预留超时、已预留后
-// 取消）统一适用：超门槛的必须经出资账户在预留时刻批准，未超门槛的直接
-// 受理、不得携带批准人或决定时间。
-func validateReservedOrigin(r *request, p *policy, approvalRequired, reservedOrigin bool) error {
+// 预留时长快照必须与策略一致，且审批路径（批准人、决定时间、等待期限）与
+// 费用/门槛相匹配。对所有发生过预留的状态（已预留、已结算、预留超时、
+// 已预留后取消）统一适用：超门槛的必须经出资账户在等待期限内于预留时刻
+// 批准，未超门槛的直接受理、不得携带批准人或决定时间。
+func validateReservedOrigin(r *request, p *policy, sess *session, approvalRequired, reservedOrigin bool) error {
 	if !reservedOrigin {
 		return errors.New("request is in a reserved-origin state but missing reserved_at")
 	}
@@ -951,6 +993,11 @@ func validateReservedOrigin(r *request, p *policy, approvalRequired, reservedOri
 		}
 		if !r.decidedAt.Equal(r.reservedAt) {
 			return errors.New("approved request decided_at must equal reserved_at")
+		}
+		// 等待截止时刻与批准时刻必须是正常审批流程能够产生的历史：即使该
+		// 预留后来已经结算、取消或超时退回，也不放宽这一要求。
+		if err := validateApprovalTiming(r, p, sess); err != nil {
+			return err
 		}
 	} else {
 		if r.approverAccountID != "" {

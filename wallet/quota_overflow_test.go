@@ -26,10 +26,12 @@ func buildMaxQuotaBackup(t *testing.T, t0 time.Time, threshold, available int64)
 		ReservedAt: timeJSON(t0.Add(-2 * time.Hour)),
 		SettledAt:  timeJSON(t0.Add(-time.Hour)),
 	}
-	// 开启审批时该笔费用严格超过门槛，备份自洽要求带批准人与决定时刻。
+	// 开启审批时该笔费用严格超过门槛，备份自洽要求带批准人、决定时刻与
+	// 等待截止时刻（提交于 t0-2h，等待 1h，故截止 t0-1h，批准于提交时刻）。
 	if threshold > 0 {
 		r.ApproverAccountID = "payer"
 		r.DecidedAt = r.ReservedAt
+		r.WaitDeadline = timeJSON(time.Time(r.CreatedAt).Add(time.Hour))
 	}
 	b := backupV1{
 		Version: backupVersion,
@@ -228,6 +230,7 @@ func buildApproveOverflowBackup(t *testing.T, t0 time.Time, reserveDur time.Dura
 		EstimatedFee:      bigFee,
 		State:             int(RequestReserved),
 		CreatedAt:         timeJSON(t0),
+		WaitDeadline:      timeJSON(t0.Add(time.Hour)),
 		ReservedAt:        timeJSON(t0),
 		ReserveDuration:   durationJSON(reserveDur),
 		ApproverAccountID: "payer",
