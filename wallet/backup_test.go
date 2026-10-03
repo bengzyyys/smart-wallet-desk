@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -809,6 +810,16 @@ func TestRestoreRejectsCorruptBackups(t *testing.T) {
 			a := m["accounts"].([]interface{})
 			a[0].(map[string]interface{})["reserved"] = -1
 		}},
+		{"available plus reserved overflows int64", func(m map[string]interface{}) {
+			// payer 的预留来自多条策略、多使用账户；把可用余额顶到上限后，
+			// 合计必然越界（账户预留与请求求和仍一致，不能因单策略合法而放过）。
+			for _, a := range m["accounts"].([]interface{}) {
+				am := a.(map[string]interface{})
+				if am["id"] == "payer" {
+					am["available"] = math.MaxInt64
+				}
+			}
+		}},
 		{"negative ledger amount", func(m map[string]interface{}) {
 			l := m["ledger"].([]interface{})
 			l[0].(map[string]interface{})["amount"] = -1
@@ -1022,6 +1033,278 @@ func TestRestoreRejectsInt64Overflow(t *testing.T) {
 		t.Fatal("overflow backup restored")
 	} else if !errors.Is(err, ErrBackupInvalid) {
 		t.Fatalf("overflow err = %v, want ErrBackupInvalid", err)
+	}
+}
+
+// capSkeleton 构造一个金额可任意配置的最小合法备份：出资账户 payer、使用
+// 账户 u1/u2 及各自会话、一条直接受理策略 p。调用方按需改写余额、策略
+// 预留/已花费总额并追加请求。
+func capSkeleton(t0 time.Time, reserveDuration time.Duration) *backupV1 {
+	return &backupV1{
+		Version:    backupVersion,
+		ExportedAt: timeJSON(t0),
+		Accounts: []accountBackupV1{
+			{ID: "payer", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+			{ID: "u1", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+			{ID: "u2", Available: 0, Reserved: 0, CreatedAt: timeJSON(t0)},
+		},
+		Sessions: []sessionBackupV1{
+			{ID: "s1", AccountID: "u1", DeviceID: "d1", ExpiresAt: timeJSON(t0.Add(time.Hour)), CreatedAt: timeJSON(t0)},
+			{ID: "s2", AccountID: "u2", DeviceID: "d2", ExpiresAt: timeJSON(t0.Add(time.Hour)), CreatedAt: timeJSON(t0)},
+		},
+		Policies: []policyBackupV1{{
+			ID: "p", PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
+			Operation: "charge", Payee: "shop",
+			StartsAt: timeJSON(t0.Add(-time.Hour)), EndsAt: timeJSON(t0.Add(time.Hour)),
+			MaxPerRequest:      math.MaxInt64,
+			MaxTotal:           math.MaxInt64,
+			MaxReserveDuration: durationJSON(reserveDuration),
+		}},
+		Requests: []requestBackupV1{},
+		Ledger:   []ledgerEntryBackupV1{},
+	}
+}
+
+// capReservedRequest 构造一条由 payer 出资、直接受理的已预留请求。
+func capReservedRequest(policy, rid, account, sess string, fee int64, reservedAt time.Time, dur time.Duration) requestBackupV1 {
+	r := requestBackupV1{
+		PolicyID: policy, RequestID: rid, AccountID: account, PayerAccountID: "payer",
+		SessionID: sess, Operation: "charge", Payee: "shop",
+		EstimatedFee:    fee,
+		State:           int(RequestReserved),
+		CreatedAt:       timeJSON(reservedAt),
+		ReservedAt:      timeJSON(reservedAt),
+		ReserveDuration: durationJSON(dur),
+	}
+	if dur > 0 {
+		r.ReserveDeadline = timeJSON(reservedAt.Add(dur))
+	}
+	return r
+}
+
+func mustMarshalBackup(t *testing.T, b *backupV1) []byte {
+	t.Helper()
+	data, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func mustRestoreAt(t *testing.T, b *backupV1, now time.Time) *Wallet {
+	t.Helper()
+	w, err := restoreAt(mustMarshalBackup(t, b), now)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	return w
+}
+
+// TestRestoreRejectsAvailablePlusReservedOverflow 验证恢复时拒绝“可用余额 +
+// 仍处于已预留状态费用”超过 int64 上限的备份：预留尚未到期要当场拒绝；
+// 恢复时已到期、本应自动退款的也要在退款前拒绝；跨策略、跨使用账户但由
+// 同一账户出资的预留必须合并计入。
+func TestRestoreRejectsAvailablePlusReservedOverflow(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	assertReject := func(t *testing.T, b *backupV1, now time.Time) {
+		t.Helper()
+		w, err := restoreAt(mustMarshalBackup(t, b), now)
+		if err == nil {
+			t.Fatalf("overflow backup restored a wallet: %+v", w)
+		}
+		if !errors.Is(err, ErrBackupInvalid) {
+			t.Fatalf("err = %v, want ErrBackupInvalid", err)
+		}
+		// 原因必须说明具体账户与越界的合计上限。
+		if !strings.Contains(err.Error(), "payer") || !strings.Contains(err.Error(), "9223372036854775807") {
+			t.Fatalf("error does not name account or int64 limit: %v", err)
+		}
+		if w != nil {
+			t.Fatalf("partial wallet returned despite invalid backup")
+		}
+	}
+
+	t.Run("reserved not due yet", func(t *testing.T) {
+		// 可用余额为上限，另有一笔金额 1 的未到期有效预留；不能等取消时才暴露。
+		b := capSkeleton(t0, 0)
+		b.Accounts[0].Available = math.MaxInt64
+		b.Accounts[0].Reserved = 1
+		b.Policies[0].ReservedTotal = 1
+		b.Requests = append(b.Requests, capReservedRequest("p", "r1", "u1", "s1", 1, t0, 0))
+		assertReject(t, b, t0)
+	})
+
+	t.Run("reservation already due at restore", func(t *testing.T) {
+		// 截止 t0-1m：恢复时本会自动退回 1 而越界。拒绝必须发生在退款之前；
+		// 在截止时刻之前（预留尚未到期）恢复同样必须拒绝。
+		b := capSkeleton(t0, time.Minute)
+		b.Accounts[0].Available = math.MaxInt64
+		b.Accounts[0].Reserved = 1
+		b.Policies[0].ReservedTotal = 1
+		reservedAt := t0.Add(-2 * time.Minute)
+		b.Requests = append(b.Requests, capReservedRequest("p", "r1", "u1", "s1", 1, reservedAt, time.Minute))
+		assertReject(t, b, reservedAt) // 尚未到期
+		assertReject(t, b, t0)         // 已到期，本应自动退款
+	})
+
+	t.Run("summed across policies and usage accounts", func(t *testing.T) {
+		// 每条策略各自的预留金额（2 与 1）都合法，但同一出资账户的预留合计
+		// 为 3，与可用余额 MaxInt64-2 相加越界。
+		b := capSkeleton(t0, 0)
+		b.Policies = append(b.Policies, policyBackupV1{
+			ID: "p2", PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
+			Operation: "charge", Payee: "shop",
+			StartsAt:      timeJSON(t0.Add(-time.Hour)),
+			EndsAt:        timeJSON(t0.Add(time.Hour)),
+			MaxPerRequest: math.MaxInt64,
+			MaxTotal:      math.MaxInt64,
+		})
+		b.Accounts[0].Available = math.MaxInt64 - 2
+		b.Accounts[0].Reserved = 3
+		b.Policies[0].ReservedTotal = 2
+		b.Policies[1].ReservedTotal = 1
+		b.Requests = append(b.Requests,
+			capReservedRequest("p", "r1", "u1", "s1", 2, t0, 0),
+			capReservedRequest("p2", "r2", "u2", "s2", 1, t0, 0),
+		)
+		assertReject(t, b, t0)
+	})
+}
+
+// TestRestoreAcceptsAvailablePlusReservedAtLimit 验证边界：合计恰好等于上限
+// 合法——上限减 1 加预留 1 可以恢复，随后取消（或恢复时预留超时退款）得到
+// 恰好上限的可用余额；没有预留时可用余额等于上限也可以恢复。
+func TestRestoreAcceptsAvailablePlusReservedAtLimit(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("max minus one plus one then cancel", func(t *testing.T) {
+		b := capSkeleton(t0, 0)
+		b.Accounts[0].Available = math.MaxInt64 - 1
+		b.Accounts[0].Reserved = 1
+		b.Policies[0].ReservedTotal = 1
+		b.Requests = append(b.Requests, capReservedRequest("p", "r1", "u1", "s1", 1, t0, 0))
+		w := mustRestoreAt(t, b, t0)
+		if bal, _ := w.Balance("payer"); bal != (Balances{Available: math.MaxInt64 - 1, Reserved: 1}) {
+			t.Fatalf("balance at restore = %+v", bal)
+		}
+		// 取消退回 1：可用余额恰好到达上限，不得变负或报错。
+		if _, err := w.Cancel("u1", "r1"); err != nil {
+			t.Fatalf("cancel at boundary: %v", err)
+		}
+		if bal, _ := w.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+			t.Fatalf("balance after cancel = %+v, want available at int64 max", bal)
+		}
+	})
+
+	t.Run("max minus one plus one refunded by timeout at restore", func(t *testing.T) {
+		// 恢复时预留已到期：自动全额退回后可用余额恰好为上限。
+		b := capSkeleton(t0, time.Minute)
+		b.Accounts[0].Available = math.MaxInt64 - 1
+		b.Accounts[0].Reserved = 1
+		b.Policies[0].ReservedTotal = 1
+		reservedAt := t0.Add(-2 * time.Minute)
+		deadline := reservedAt.Add(time.Minute)
+		b.Requests = append(b.Requests, capReservedRequest("p", "r1", "u1", "s1", 1, reservedAt, time.Minute))
+		w := mustRestoreAt(t, b, t0)
+		if bal, _ := w.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+			t.Fatalf("balance after timeout refund = %+v, want available at int64 max", bal)
+		}
+		r, err := w.Request("u1", "r1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.State != RequestReservationExpired || !r.ReserveExpiredAt.Equal(deadline) {
+			t.Fatalf("request = %+v, want reservation-expired at original deadline %v", r, deadline)
+		}
+	})
+
+	t.Run("max available with no reservations", func(t *testing.T) {
+		b := capSkeleton(t0, 0)
+		b.Accounts[0].Available = math.MaxInt64
+		w := mustRestoreAt(t, b, t0)
+		if bal, _ := w.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+			t.Fatalf("balance = %+v", bal)
+		}
+	})
+}
+
+// TestRestoreOverflowCheckCountsOnlyLiveReservations 验证待审批（未冻结费用）、
+// 已结算（实际费用已花出）、已取消与已预留超时（预留早已释放）的历史金额
+// 不再算作可退回资金：即使可用余额已达上限，这些状态也不会导致备份被拒。
+func TestRestoreOverflowCheckCountsOnlyLiveReservations(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	// 骨架策略 p 不启用预留超时，承载已结算与已预留后取消的历史请求。
+	b := capSkeleton(t0, 0)
+	// p-time：启用预留超时，承载已处于预留超时终态的历史请求。
+	b.Policies = append(b.Policies, policyBackupV1{
+		ID: "p-time", PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
+		Operation: "charge", Payee: "shop",
+		StartsAt:           timeJSON(t0.Add(-time.Hour)),
+		EndsAt:             timeJSON(t0.Add(time.Hour)),
+		MaxPerRequest:      math.MaxInt64,
+		MaxTotal:           math.MaxInt64,
+		MaxReserveDuration: durationJSON(time.Minute),
+	})
+	// p-app：开启审批，承载仍处于待审批（未冻结费用）的请求。
+	b.Policies = append(b.Policies, policyBackupV1{
+		ID: "p-app", PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
+		Operation: "charge", Payee: "shop",
+		StartsAt:          timeJSON(t0.Add(-time.Hour)),
+		EndsAt:            timeJSON(t0.Add(time.Hour)),
+		MaxPerRequest:     math.MaxInt64,
+		MaxTotal:          math.MaxInt64,
+		ApprovalThreshold: 10,
+		ApprovalWait:      durationJSON(5 * time.Minute),
+	})
+	// 没有任何仍处于已预留状态的请求：账户预留为 0，可用余额为上限。
+	b.Accounts[0].Available = math.MaxInt64
+	// 已结算请求的实际费用 5 计入策略已花费总额。
+	b.Policies[0].SpentTotal = 5
+
+	reservedAt := t0.Add(-10 * time.Minute)
+	timeDeadline := reservedAt.Add(time.Minute)
+	b.Requests = append(b.Requests,
+		// 已结算（无超时策略）：实际费用已花出，不再占用预留。
+		requestBackupV1{
+			PolicyID: "p", RequestID: "r-settled", AccountID: "u1", PayerAccountID: "payer",
+			SessionID: "s1", Operation: "charge", Payee: "shop",
+			EstimatedFee: 5, ActualFee: 5, State: int(RequestSettled),
+			CreatedAt: timeJSON(reservedAt), ReservedAt: timeJSON(reservedAt),
+			SettledAt: timeJSON(reservedAt.Add(time.Minute)),
+		},
+		// 已预留后取消（无超时策略）：预留早已退回，不再占用。
+		requestBackupV1{
+			PolicyID: "p", RequestID: "r-cancelled", AccountID: "u1", PayerAccountID: "payer",
+			SessionID: "s1", Operation: "charge", Payee: "shop",
+			EstimatedFee: 5, State: int(RequestCancelled),
+			CreatedAt: timeJSON(reservedAt), ReservedAt: timeJSON(reservedAt),
+		},
+		// 预留超时终态：预留已在截止时刻自动退回。
+		requestBackupV1{
+			PolicyID: "p-time", RequestID: "r-timeout", AccountID: "u1", PayerAccountID: "payer",
+			SessionID: "s1", Operation: "charge", Payee: "shop",
+			EstimatedFee: 5, State: int(RequestReservationExpired),
+			CreatedAt: timeJSON(reservedAt), ReservedAt: timeJSON(reservedAt),
+			ReserveDuration: durationJSON(time.Minute), ReserveDeadline: timeJSON(timeDeadline),
+			ReserveExpiredAt: timeJSON(timeDeadline),
+		},
+		// 待审批：从未冻结费用，等待截止 t0+5m，恢复时尚未到期。
+		requestBackupV1{
+			PolicyID: "p-app", RequestID: "r-pending", AccountID: "u1", PayerAccountID: "payer",
+			SessionID: "s1", Operation: "charge", Payee: "shop",
+			EstimatedFee: 20, State: int(RequestPendingApproval),
+			CreatedAt:    timeJSON(t0),
+			WaitDeadline: timeJSON(t0.Add(5 * time.Minute)),
+		},
+	)
+
+	w := mustRestoreAt(t, b, t0)
+	if bal, _ := w.Balance("payer"); bal != (Balances{Available: math.MaxInt64, Reserved: 0}) {
+		t.Fatalf("balance = %+v, historical fees must not count as reserved", bal)
+	}
+	if r, err := w.Request("u1", "r-pending"); err != nil || r.State != RequestPendingApproval {
+		t.Fatalf("pending request = %+v err = %v", r, err)
 	}
 }
 
