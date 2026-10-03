@@ -185,9 +185,21 @@ func (w *Wallet) CreateSession(id, accountID, deviceID string, expiresAt time.Ti
 	return sess.view(), nil
 }
 
-// RevokeSession 主动吊销会话。会话不存在返回错误；重复吊销视为成功。
-// 吊销后不再受理该会话的新申请；仍在待审批的请求进入拒绝终态并说明
-// 原因，已预留费用的请求仍可结算或取消。
+// RevokeSession 主动吊销会话。会话不存在返回 ErrSessionNotFound；已经到期
+// 的会话也允许吊销；重复吊销视为成功且不重复留痕。吊销后不再受理该会话
+// 的新申请。
+//
+// 吊销瞬间按各请求自身的等待截止时间分别结清该会话仍在待审批的请求：
+// 当前时刻严格早于截止时间的进入拒绝终态并说明申请会话已被吊销，决定
+// 时间为吊销时刻；当前时刻等于或晚于截止时间（等待时长耗尽、策略结束
+// 或申请会话到期先发生）的进入过期终态，不带吊销拒绝原因、不填写审批
+// 账户，提交时间与等待截止时间保持不变。终态结果只取决于申请自身的
+// 期限，不因吊销前是否被查询过而不同；先前已进入终态的请求保留原决定
+// 信息与历史记录。
+//
+// 两类处理都不冻结费用：不改变出资余额、策略预留总额和已花费总额，也不
+// 生成退款、扣减或预留记录。已预留请求继续按原规则结算、取消或等待自身
+// 预留超时，吊销不提前释放费用；其他会话的申请不受影响。
 func (w *Wallet) RevokeSession(id string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -202,9 +214,28 @@ func (w *Wallet) RevokeSession(id string) error {
 	sess.revoked = true
 	now := w.now()
 	reason := "application session revoked before approval"
-	// 仍在待审批的请求随会话吊销进入拒绝终态。
+
+	// 按等待截止时刻顺序收集本会话仍在待审批的请求（同截止时刻按使用
+	// 账户、请求编号排序），保证多笔申请分别处理时账本追加顺序确定。
+	pending := make([]*request, 0)
 	for _, req := range w.requests {
 		if req.state == RequestPendingApproval && req.sessionID == sess.id {
+			pending = append(pending, req)
+		}
+	}
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].waitDeadline.Equal(pending[j].waitDeadline) {
+			if pending[i].accountID != pending[j].accountID {
+				return pending[i].accountID < pending[j].accountID
+			}
+			return pending[i].requestID < pending[j].requestID
+		}
+		return pending[i].waitDeadline.Before(pending[j].waitDeadline)
+	})
+
+	for _, req := range pending {
+		if now.Before(req.waitDeadline) {
+			// 未到等待期限：随会话吊销进入拒绝终态。
 			req.state = RequestRejected
 			req.rejectReason = reason
 			req.decidedAt = now
@@ -215,7 +246,19 @@ func (w *Wallet) RevokeSession(id string) error {
 				Reason:    reason,
 				At:        now,
 			})
+			continue
 		}
+		// 已到（含恰到）或超过等待期限：进入过期终态，与惰性过期口径一致，
+		// 不带吊销拒绝原因、不填写审批账户。
+		req.state = RequestExpired
+		req.decidedAt = now
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerExpiration,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "approval period expired",
+			At:        now,
+		})
 	}
 	return nil
 }

@@ -103,8 +103,9 @@ const (
 	// RequestPendingApproval 预估费用超过审批门槛，等待出资账户审批；
 	// 此状态不冻结余额、不占用共享累计额度。
 	RequestPendingApproval
-	// RequestRejected 已被拒绝（审批拒绝、申请会话提前吊销或策略被停用），
-	// 终态。
+	// RequestRejected 已被拒绝（审批拒绝、申请会话在等待期限内被吊销或
+	// 策略被停用），终态。已到等待截止时刻后才吊销会话的请求不进入此态，
+	// 而是 RequestExpired。
 	RequestRejected
 	// RequestExpired 待审批超过等待期限未获批准，终态。
 	RequestExpired
