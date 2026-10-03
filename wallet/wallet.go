@@ -185,9 +185,16 @@ func (w *Wallet) CreateSession(id, accountID, deviceID string, expiresAt time.Ti
 	return sess.view(), nil
 }
 
-// RevokeSession 主动吊销会话。会话不存在返回错误；重复吊销视为成功。
-// 吊销后不再受理该会话的新申请；仍在待审批的请求进入拒绝终态并说明
-// 原因，已预留费用的请求仍可结算或取消。
+// RevokeSession 主动吊销会话。会话不存在返回 ErrSessionNotFound；重复吊销
+// 视为成功且不重复留痕；已经到期的会话也允许主动吊销。
+//
+// 吊销后不再受理该会话的新申请。吊销瞬间仍在待审批的请求按各自的等待
+// 截止时间区分结果（与是否曾被查询过无关）：当前时刻严格早于截止时间的
+// 进入拒绝终态，拒绝信息说明申请会话已被吊销，决定时间为吊销时刻；当前
+// 时刻等于或晚于截止时间的进入过期终态，不带吊销拒绝原因、不填写审批
+// 账户，决定时间与账本时间均为本次吊销时刻。两类处理都不冻结余额、不
+// 占用额度，也不产生退款。已预留费用的请求仍可结算或取消；已有终态的
+// 请求与其他会话的请求均不受影响。
 func (w *Wallet) RevokeSession(id string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -197,14 +204,34 @@ func (w *Wallet) RevokeSession(id string) error {
 		return fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 	}
 	if sess.revoked {
+		// 重复吊销幂等返回：终态请求与账本均保持首次吊销的结果。
 		return nil
 	}
 	sess.revoked = true
 	now := w.now()
-	reason := "application session revoked before approval"
-	// 仍在待审批的请求随会话吊销进入拒绝终态。
+
+	// 收集本会话仍在待审批的请求，按等待截止时刻顺序处理（同截止时刻
+	// 按使用账户、请求编号排序），保证账本追加顺序确定。
+	pending := make([]*request, 0)
 	for _, req := range w.requests {
 		if req.state == RequestPendingApproval && req.sessionID == sess.id {
+			pending = append(pending, req)
+		}
+	}
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].waitDeadline.Equal(pending[j].waitDeadline) {
+			if pending[i].accountID != pending[j].accountID {
+				return pending[i].accountID < pending[j].accountID
+			}
+			return pending[i].requestID < pending[j].requestID
+		}
+		return pending[i].waitDeadline.Before(pending[j].waitDeadline)
+	})
+
+	reason := "application session revoked before approval"
+	for _, req := range pending {
+		if now.Before(req.waitDeadline) {
+			// 未到等待期限：随会话吊销立即拒绝。
 			req.state = RequestRejected
 			req.rejectReason = reason
 			req.decidedAt = now
@@ -215,7 +242,19 @@ func (w *Wallet) RevokeSession(id string) error {
 				Reason:    reason,
 				At:        now,
 			})
+			continue
 		}
+		// 已到（含恰到）或超过等待期限（等待时长耗尽、策略结束或申请
+		// 会话到期先发生）：进入过期终态，不能因未被查询过而记成吊销拒绝。
+		req.state = RequestExpired
+		req.decidedAt = now
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerExpiration,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "approval period expired",
+			At:        now,
+		})
 	}
 	return nil
 }
