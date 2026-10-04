@@ -370,6 +370,17 @@ func addInt64(sum, x int64) (int64, bool) {
 // 预留与结算时刻，与恢复时的当前时间无关：期限内完成的结算即使很久以后恢复
 // 仍保持已结算，余额、策略已花费总额与既有账本原样保留，不追加退款或超时
 // 记录。
+// 直接受理（策略关闭审批，或预估费用没有严格超过审批门槛）且曾经预留过费用
+// 的请求（恢复时仍为已预留，或后来已结算、已取消、已预留超时）还必须通过
+// 预留起点核对：正常申请无需审批时提交成功即同时完成费用预留，故实际预留
+// 时刻必须与提交时刻表示同一绝对瞬间；起点提前或推迟都拒绝，即使只差一纳秒，
+// 即使预留截止时刻与备份中的预留起点、时长仍然相符，即使账户预留余额、策略
+// 累计金额与请求金额全部对得上。关闭预留超时的策略同样不允许预留起点与提交
+// 时刻脱离。时间按完整绝对瞬间比较，不同时区写法表示的同一时刻照常接受，不
+// 按文本或整秒判断。被篡改的截止时刻即使在恢复时已经过去也必须拒绝，不会先
+// 退款再把矛盾历史当成合法备份，也不通过改写时间补救。经大额审批后才预留的
+// 请求从批准成功时刻起算、实际预留允许晚于提交，不适用本核对，仍按既有审批
+// 时限规则恢复。
 // 任一策略现存预留费用与已结算实际费用的合计严格超过其
 // 共享累计上限时同样拒绝（同一策略的多个使用账户合并计算，不同策略分别
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
@@ -1183,7 +1194,8 @@ func validateExpirationTiming(r *request, p *policy, sess *session) error {
 // 预留时长快照必须与策略一致，且审批路径（批准人、决定时间、等待期限）与
 // 费用/门槛相匹配。对所有发生过预留的状态（已预留、已结算、预留超时、
 // 已预留后取消）统一适用：超门槛的必须经出资账户在等待期限内于预留时刻
-// 批准，未超门槛的直接受理、不得携带批准人或决定时间。
+// 批准，未超门槛的直接受理、不得携带批准人或决定时间，且实际预留时刻必须
+// 与提交时刻为同一绝对瞬间（见 validateDirectReserveTiming）。
 func validateReservedOrigin(r *request, p *policy, sess *session, approvalRequired, reservedOrigin bool) error {
 	if !reservedOrigin {
 		return errors.New("request is in a reserved-origin state but missing reserved_at")
@@ -1210,6 +1222,35 @@ func validateReservedOrigin(r *request, p *policy, sess *session, approvalRequir
 		if !r.decidedAt.IsZero() {
 			return errors.New("directly reserved request must not carry decided_at")
 		}
+		// 直接受理：提交成功的同一时刻就完成费用预留，实际预留时刻不得与提交
+		// 时刻脱离（经批准的请求从批准时刻起算，不受此限）。
+		if err := validateDirectReserveTiming(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateDirectReserveTiming 校验“直接受理”（策略关闭审批，或预估费用没有
+// 严格超过审批门槛）的请求：正常申请无需审批时，提交成功就同时完成费用预留，
+// 因此备份记载的实际预留时刻 ReservedAt 必须与提交时刻 CreatedAt 表示同一
+// 绝对瞬间。仅核对预留截止时刻等于“预留起点 + 时长”不足以发现该类损坏：
+// 预留起点与截止时刻被一起平移时，三元组仍然自洽，却会让本应从受理时刻起算
+// 的预留被延后（或提前）释放。
+//
+// 只要请求曾经预留过费用就适用：仍处于已预留、已经结算、已经取消（已预留后
+// 再取消）或已经预留超时均不豁免；关闭预留超时（reserveDuration==0）的策略
+// 同样不能允许预留起点与提交时刻脱离。起点提前或推迟都拒绝，即使只差一纳秒。
+// 时间一律按保存的完整时刻以 time.Time.Equal 比较绝对瞬间：纳秒精度保留，
+// 不同时区写法表示的同一时刻判定相同，不按文本或整秒判断。
+//
+// 经过大额审批后才预留的请求从批准成功时刻起算，实际预留允许晚于提交，由
+// validateApprovalTiming 另行核对，不适用本规则。该校验只看备份记载的提交与
+// 预留历史，与恢复时的当前时间无关：被篡改的截止时刻即使在恢复时已经过去，
+// 也必须拒绝，不能先按超时退款再把矛盾历史当成合法备份。
+func validateDirectReserveTiming(r *request) error {
+	if !r.reservedAt.Equal(r.createdAt) {
+		return fmt.Errorf("directly reserved request reserved_at %v must equal created_at %v", r.reservedAt, r.createdAt)
 	}
 	return nil
 }
