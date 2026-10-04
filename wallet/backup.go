@@ -315,7 +315,15 @@ func addInt64(sum, x int64) (int64, bool) {
 // 账本类型、非法金额或策略参数、悬空引用、申请会话不属于使用账户、
 // 请求出资账户与策略不符，或余额/累计金额与请求求和不一致（含求和超出
 // int64 范围），都返回包装了具体原因的 ErrBackupInvalid，绝不会返回
-// 部分恢复的钱包。曾经批准成功并实际预留费用的超门槛请求（恢复时仍为
+// 部分恢复的钱包。每笔已受理请求记载的提交时刻还必须落在关联策略的时间
+// 窗内且不晚于申请会话到期：不早于策略开始时刻（恰在开始时刻提交可以
+// 接受）、严格早于策略结束时刻、严格早于申请会话到期时刻（恰在策略结束
+// 或会话到期时提交必须拒绝）；正常提交时这些时刻的申请本就会被拒绝，
+// 不可能成为已受理请求。直接预留与经过审批的申请适用同一规则，后来已
+// 结算、取消、拒绝或过期的请求也不豁免；该核对只针对备份记载的提交历史，
+// 不以恢复时的当前时间替代，因此申请当时符合条件、之后会话到期或被吊销、
+// 策略结束或被停用的请求仍按现有规则恢复。未被受理的申请留下的独立拒绝
+// 账本记录不关联请求，不适用本规则，仍原样保留。曾经批准成功并实际预留费用的超门槛请求（恢复时仍为
 // 已预留，或后来已结算、已取消、已预留超时）还必须通过审批时限核对：
 // 保存的等待截止时刻必须与提交时刻加策略等待时长、策略结束时间、申请
 // 会话到期时间三者的最早值一致（缺失、提前、推迟都拒绝），且批准决定
@@ -813,12 +821,43 @@ func validateSettlementTiming(r *request) error {
 	return nil
 }
 
+// validateSubmissionTiming 校验请求记载的提交时刻必须是正常申请能够产生的
+// 历史：正常提交时，策略尚未开始、已经结束或申请会话已经到期的申请都会被
+// 拒绝（只留下不关联请求的拒绝账本记录），不可能进入已受理请求序列。因此
+// 备份中每笔已受理请求的提交时刻必须：
+//   - 不早于关联策略的开始时刻（恰在策略开始时提交可以接受）；
+//   - 严格早于策略结束时刻（恰在策略结束时提交必须拒绝）；
+//   - 严格早于申请会话的到期时刻（恰在会话到期时提交必须拒绝）。
+//
+// 直接预留与经过审批的申请适用同一规则；后来已经结算、取消、拒绝或过期
+// （含预留超时）的请求也不豁免。时间一律按保存的完整时刻以 time.Time 的
+// 绝对瞬间比较（Before）：纳秒精度保留，不同时区表示的同一时刻判定相同。
+// 该校验只针对备份记载的提交历史，与恢复时的当前时间无关：申请当时符合
+// 条件、之后会话到期或被吊销、策略结束或被停用的请求仍按现有规则恢复。
+func validateSubmissionTiming(r *request, p *policy, sess *session) error {
+	if r.createdAt.Before(p.startsAt) {
+		return fmt.Errorf("created_at %v is before policy %q window starts_at %v", r.createdAt, p.id, p.startsAt)
+	}
+	if !r.createdAt.Before(p.endsAt) {
+		return fmt.Errorf("created_at %v is not strictly before policy %q window ends_at %v", r.createdAt, p.id, p.endsAt)
+	}
+	if !r.createdAt.Before(sess.expiresAt) {
+		return fmt.Errorf("created_at %v is not strictly before session %q expiry %v", r.createdAt, sess.id, sess.expiresAt)
+	}
+	return nil
+}
+
 // validateRequestTimingAndState 校验请求状态与其计时/金额字段自洽，并与
 // 不可变的策略条件、申请会话保持一致，防止任意状态搭配任意时间戳的损坏
 // 备份。sess 为该请求的申请会话。
 func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	if r.createdAt.IsZero() {
 		return errors.New("request missing created_at")
+	}
+	// 提交时刻必须是正常申请能够产生的历史：落在策略时间窗内且申请会话
+	// 尚未到期。对直接预留与经过审批的申请、以及所有后续状态统一适用。
+	if err := validateSubmissionTiming(r, p, sess); err != nil {
+		return err
 	}
 	if r.operation == "" || r.payee == "" {
 		return errors.New("operation and payee are required")
