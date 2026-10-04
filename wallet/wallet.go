@@ -616,10 +616,10 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 	payer := w.accounts[req.payerAccountID]
 	refund := req.estimatedFee - actualFee
 
-	// 扣除实际费用、退回差额、释放共享额度。
-	payer.reserved -= req.estimatedFee
-	payer.available += refund
-	p.reservedTotal -= req.estimatedFee
+	// 先按统一规则释放全部预估费用的预留，再从中扣除实际费用：
+	// 退回可用余额的差额即 预估费用-实际费用，策略已花费总额只增加实际费用。
+	w.releaseReservationLocked(p, payer, req)
+	payer.available -= actualFee
 	p.spentTotal += actualFee
 
 	req.state = RequestSettled
@@ -688,12 +688,9 @@ func (w *Wallet) Cancel(accountID, requestID string) (RequestView, error) {
 		return RequestView{}, fmt.Errorf("%w: request %s is %v, cannot cancel", ErrRequestNotReserved, requestID, req.state)
 	}
 
-	// 已预留：退回全部预留。
+	// 已预留：按统一规则释放全部预留，预估费用全额退回出资账户可用余额。
 	payer := w.accounts[req.payerAccountID]
-
-	payer.reserved -= req.estimatedFee
-	payer.available += req.estimatedFee
-	p.reservedTotal -= req.estimatedFee
+	w.releaseReservationLocked(p, payer, req)
 
 	req.state = RequestCancelled
 
@@ -1036,17 +1033,12 @@ func (w *Wallet) expireReservationsLocked(now time.Time) {
 }
 
 // expireReservationLocked 将一笔已预留请求转为 RequestReservationExpired
-// 终态：全额退回预估费用到出资账户可用余额，减少出资账户预留余额与该
-// 策略的预留总额，不增加实际费用或已花费总额。账本增加一条出资账户的
-// 全额退款记录和一条使用账户的零金额超时状态记录，均关联请求编号。
-// 必须在持锁状态下调用。
+// 终态：按统一规则释放全部预留（预估费用全额退回出资账户可用余额），不增加
+// 实际费用或已花费总额。账本增加一条出资账户的全额退款记录和一条使用账户的
+// 零金额超时状态记录，均关联请求编号。必须在持锁状态下调用。
 func (w *Wallet) expireReservationLocked(req *request, deadline time.Time) {
 	payer := w.accounts[req.payerAccountID]
-	payer.reserved -= req.estimatedFee
-	payer.available += req.estimatedFee
-	if p := w.policies[req.policyID]; p != nil {
-		p.reservedTotal -= req.estimatedFee
-	}
+	w.releaseReservationLocked(w.policies[req.policyID], payer, req)
 	req.state = RequestReservationExpired
 	req.reserveExpiredAt = deadline
 
@@ -1105,6 +1097,27 @@ func (w *Wallet) reserveFeeLocked(p *policy, payer *account, req *request, reser
 		Reason:    reason,
 		At:        reservedAt,
 	})
+}
+
+// releaseReservationLocked 释放一笔已预留请求占用的全部预估费用，供结算、
+// 取消与预留超时三种路径共用同一套资金核算规则，与 reserveFeeLocked 对称：
+//   - 出资账户的预留余额减少该请求的预估费用全额，同时全额退回其可用余额；
+//     资金始终回到策略指定的出资账户，不因申请账户不同而改变；
+//   - 该请求所属策略的预留总额同步减少预估费用全额，已花费总额不变；
+//   - 其他请求占用的金额保持不变。
+//
+// 本函数只完成资金释放，不改变请求状态、不记账：结算的实际扣款（从退回的
+// 可用余额中扣除实际费用并计入策略已花费总额）以及各路径自己的账本记录由
+// 调用方随后完成。资金变化与调用方的状态变更、账本记录在同一次持锁调用中
+// 完成，不会观察到只完成一部分的结果。p 为 nil 时跳过策略总额（防御性
+// 处理：策略不会被删除，正常路径恒为非空）。必须在持锁状态下调用。
+func (w *Wallet) releaseReservationLocked(p *policy, payer *account, req *request) {
+	fee := req.estimatedFee
+	payer.reserved -= fee
+	payer.available += fee
+	if p != nil {
+		p.reservedTotal -= fee
+	}
 }
 
 // quotaWouldExceedLocked 判断在策略 p 上再计入 fee 后，共享累计合计是否
