@@ -323,6 +323,15 @@ func addInt64(sum, x int64) (int64, bool) {
 // 接受，恰到截止时刻批准必须拒绝）；该核对只针对备份记载的批准历史，
 // 不以恢复时的当前时间替代批准时间，因此期限内已批准的请求即使恢复时
 // 等待期限、申请会话或策略时间窗均已结束也照常恢复，不重新计时。
+// 已拒绝请求（出资账户主动拒绝、申请会话吊销或策略停用导致，原因与决定
+// 账户的区别保留）同样必须通过拒绝时限核对：保存的等待截止时刻必须存在，
+// 并与提交时刻加策略最长等待时长、策略结束时刻、申请会话到期时刻三者的
+// 最早值一致（缺失、提前、推迟都拒绝），且拒绝决定必须发生在提交时刻及
+// 之后、等待截止时刻之前（提交当时立即拒绝可以接受，截止当时才拒绝必须
+// 拒绝）；该核对只看备份记载的申请与拒绝历史，与恢复时的当前时间无关，
+// 因此期限内完成的合法拒绝即使恢复时会话已到期或被吊销、策略已结束或
+// 停用，仍保持已拒绝原样恢复，不追加过期记录、不产生资金变动。余额与
+// 策略累计金额核对一致也不能让时间矛盾的备份通过。
 // 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
 // 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
 // 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
@@ -933,6 +942,11 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if r.decidedAt.IsZero() || r.rejectReason == "" {
 			return errors.New("rejected request missing decided_at or reason")
 		}
+		// 等待截止时刻与拒绝决定时刻必须是正常审批流程能够产生的历史：
+		// 出资账户主动拒绝、申请会话吊销、策略停用三条路径统一适用。
+		if err := validateRejectionTiming(r, p, sess); err != nil {
+			return err
+		}
 	case RequestExpired:
 		if r.decidedAt.IsZero() {
 			return errors.New("expired request missing decided_at")
@@ -1001,6 +1015,37 @@ func validateApprovalTiming(r *request, p *policy, sess *session) error {
 	}
 	if !r.decidedAt.Before(r.waitDeadline) {
 		return fmt.Errorf("approval decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
+	}
+	return nil
+}
+
+// validateRejectionTiming 校验已拒绝请求保存的等待期限与拒绝决定时刻自洽，
+// 防止备份中出现正常操作不可能产生的拒绝历史：
+//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
+//     申请会话到期时间三者的最早值，提前或推迟都拒绝；
+//   - 拒绝决定时刻必须不早于提交时刻（提交当时立即拒绝可以接受），且严格
+//     早于等待截止时刻：恰到截止时刻及之后，请求只能进入待审批过期终态，
+//     任何路径都不可能再产生拒绝。
+//
+// 该规则对出资账户主动拒绝、申请会话吊销导致的拒绝、策略停用导致的拒绝
+// 统一适用；原因与决定账户（吊销拒绝不填写审批账户）的区别由其他校验保留。
+// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal/Before）：
+// 纳秒精度保留，不同时区表示的同一时刻判定相同。该校验只针对备份记载的
+// 申请与拒绝历史，与恢复时的当前时间无关：期限内完成的合法拒绝即使恢复时
+// 会话已到期或被吊销、策略已结束或停用，仍保持已拒绝原样恢复。
+func validateRejectionTiming(r *request, p *policy, sess *session) error {
+	if r.waitDeadline.IsZero() {
+		return errors.New("rejected request missing wait deadline")
+	}
+	want := expectedWaitDeadline(r, p, sess)
+	if !r.waitDeadline.Equal(want) {
+		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+	}
+	if r.decidedAt.Before(r.createdAt) {
+		return fmt.Errorf("rejection decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
+	}
+	if !r.decidedAt.Before(r.waitDeadline) {
+		return fmt.Errorf("rejection decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
 	}
 	return nil
 }
