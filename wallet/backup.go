@@ -340,6 +340,17 @@ func addInt64(sum, x int64) (int64, bool) {
 // 因此期限内完成的合法拒绝即使恢复时会话已到期或被吊销、策略已结束或
 // 停用，仍保持已拒绝原样恢复，不追加过期记录、不产生资金变动。余额与
 // 策略累计金额核对一致也不能让时间矛盾的备份通过。
+// 曾在待审批状态取消、从未预留费用的请求（已预留后再取消的沿用既有规则，
+// 不因缺少待审批取消的决定时间被拒绝）同样必须通过取消时限核对：保存的
+// 等待截止时刻必须存在，并与提交时刻加策略等待时长、策略结束时间、申请
+// 会话到期时间三者的最早值一致（缺失、提前、推迟都拒绝，哪怕保存的取消
+// 时间仍落在修改后的期限内），且取消决定必须发生在提交时刻及之后、等待
+// 截止时刻之前（提交当时就取消可以接受，恰到截止时刻或更晚取消必须拒绝；
+// 策略结束或会话到期先发生时按最早的那个时刻判断，不能只用最长等待时长）。
+// 该核对只看备份记载的申请与取消历史，与恢复时的当前时间无关，因此期限内
+// 完成的合法取消即使很久以后才恢复、申请会话已过期或吊销、策略已结束或
+// 停用，仍保持原取消状态、决定时间与账本顺序，不追加过期或退款记录，不
+// 冻结余额、不占用额度；矛盾的已取消记录不会被自动改成过期来接受备份。
 // 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
 // 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
 // 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
@@ -954,9 +965,13 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 				return err
 			}
 		} else {
-			// 待审批取消：决定时间必填。
+			// 待审批取消：决定时间必填，且等待期限与取消决定时刻必须是
+			// 正常取消能够产生的历史。
 			if r.decidedAt.IsZero() {
 				return errors.New("cancelled-from-pending request missing decided_at")
+			}
+			if err := validateCancellationTiming(r, p, sess); err != nil {
+				return err
 			}
 		}
 	case RequestPendingApproval:
@@ -1085,6 +1100,37 @@ func validateRejectionTiming(r *request, p *policy, sess *session) error {
 	}
 	if !r.decidedAt.Before(r.waitDeadline) {
 		return fmt.Errorf("rejection decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
+	}
+	return nil
+}
+
+// validateCancellationTiming 校验“待审批取消”（从未预留费用）的请求保存的
+// 等待期限与取消决定时刻自洽，防止备份中出现正常取消不可能产生的历史：
+//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
+//     申请会话到期时间三者的最早值，提前或推迟都拒绝——即使保存的取消
+//     时间仍落在修改后的期限内；
+//   - 取消决定时刻必须不早于提交时刻（提交当时就取消可以接受），且严格
+//     早于等待截止时刻：恰到截止时刻及之后，正常流程中请求已先进入待审批
+//     过期终态，不可能再被取消。
+//
+// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal/Before）：
+// 纳秒精度保留，不同时区表示的同一时刻判定相同。该校验只针对备份记载的
+// 申请与取消历史，与恢复时的当前时间无关：期限内完成的合法取消即使很久
+// 以后才恢复、申请会话已过期或吊销、策略已结束或停用，仍保持原取消状态
+// 与决定时间，不追加过期或退款记录。已预留后再取消的请求不适用本规则。
+func validateCancellationTiming(r *request, p *policy, sess *session) error {
+	if r.waitDeadline.IsZero() {
+		return errors.New("cancelled-from-pending request missing wait deadline")
+	}
+	want := expectedWaitDeadline(r, p, sess)
+	if !r.waitDeadline.Equal(want) {
+		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+	}
+	if r.decidedAt.Before(r.createdAt) {
+		return fmt.Errorf("cancellation decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
+	}
+	if !r.decidedAt.Before(r.waitDeadline) {
+		return fmt.Errorf("cancellation decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
 	}
 	return nil
 }
