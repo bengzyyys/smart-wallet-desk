@@ -365,7 +365,7 @@ func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) 
 		return PolicyView{}, fmt.Errorf("%w: %s", ErrPolicyNotFound, policyID)
 	}
 	now := w.now()
-	if err := w.checkPolicyOwnerLocked(p, sessionID, deviceID, now); err != nil {
+	if err := w.checkPayerSessionLocked(p.payerAccountID, sessionID, deviceID, now, ErrNotPolicyOwner); err != nil {
 		return PolicyView{}, err
 	}
 	// 鉴权通过后先释放已到期预留（停用不缩短任何未到期请求的截止时间）。
@@ -418,27 +418,89 @@ func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) 
 	return p.view(), nil
 }
 
-// checkPolicyOwnerLocked 在持锁状态下校验停用会话：必须存在、归属策略的
-// 出资账户、绑定当前设备、未吊销且未到期。任一不满足都返回
-// ErrNotPolicyOwner，且不改变策略、请求或账本。
-func (w *Wallet) checkPolicyOwnerLocked(p *policy, sessionID, deviceID string, now time.Time) error {
+// sessionCondition 标识会话有效性校验的结果；非 sessionOK 时为首个不满足的
+// 条件，供各入口映射为自己的公开错误。
+type sessionCondition int
+
+const (
+	// sessionOK 会话通过全部校验，仅表示身份校验通过。
+	sessionOK sessionCondition = iota
+	// sessionMissing 会话不存在。
+	sessionMissing
+	// sessionWrongAccount 会话不属于要求的账户。
+	sessionWrongAccount
+	// sessionWrongDevice 会话绑定设备与提交设备不符。
+	sessionWrongDevice
+	// sessionRevoked 会话已被吊销。
+	sessionRevoked
+	// sessionExpired 会话已到期（含到期时刻本身）。
+	sessionExpired
+)
+
+// checkSessionLocked 在持锁状态下按统一规则与固定顺序校验会话：存在性、
+// 账户归属、设备绑定、吊销、到期。多个条件同时不符时只报告顺序最靠前的一
+// 个；已吊销且已到期时报告吊销。到期时刻本身即无效：[零值, ExpiresAt) 才
+// 有效。返回命中的会话（不存在时为 nil）与首个不满足的条件；条件为
+// sessionOK 时会话一定非 nil。账户归属按提交的账户编号比较，设备按提交值
+// 与绑定值比较，不因账户正确而跳过设备。
+func (w *Wallet) checkSessionLocked(sessionID, accountID, deviceID string, now time.Time) (*session, sessionCondition) {
 	sess, ok := w.sessions[sessionID]
 	if !ok {
-		return fmt.Errorf("%w: session %s", ErrNotPolicyOwner, sessionID)
+		return nil, sessionMissing
 	}
-	if sess.accountID != p.payerAccountID {
-		return fmt.Errorf("%w: session %s belongs to account %s, not payer %s", ErrNotPolicyOwner, sess.id, sess.accountID, p.payerAccountID)
+	if sess.accountID != accountID {
+		return sess, sessionWrongAccount
 	}
 	if sess.deviceID != deviceID {
-		return fmt.Errorf("%w: session %s is bound to device %s, not %s", ErrNotPolicyOwner, sess.id, sess.deviceID, deviceID)
+		return sess, sessionWrongDevice
 	}
 	if sess.revoked {
-		return fmt.Errorf("%w: session %s revoked", ErrNotPolicyOwner, sess.id)
+		return sess, sessionRevoked
 	}
 	if !now.Before(sess.expiresAt) {
-		return fmt.Errorf("%w: session %s expired at %s", ErrNotPolicyOwner, sess.id, sess.expiresAt.Format(time.RFC3339))
+		return sess, sessionExpired
 	}
-	return nil
+	return sess, sessionOK
+}
+
+// checkPayerSessionLocked 在持锁状态下校验出资账户会话：必须存在、归属
+// payerAccountID、绑定当前设备、未吊销且未到期，规则与顺序同
+// checkSessionLocked。任一不满足都返回包装了 sentinel（ErrNotApprover 或
+// ErrNotPolicyOwner）且说明具体会话条件的错误，且不改变请求、策略、余额
+// 或账本。
+func (w *Wallet) checkPayerSessionLocked(payerAccountID, sessionID, deviceID string, now time.Time, sentinel error) error {
+	sess, cond := w.checkSessionLocked(sessionID, payerAccountID, deviceID, now)
+	switch cond {
+	case sessionOK:
+		return nil
+	case sessionMissing:
+		return fmt.Errorf("%w: session %s", sentinel, sessionID)
+	case sessionWrongAccount:
+		return fmt.Errorf("%w: session %s belongs to account %s, not payer %s", sentinel, sess.id, sess.accountID, payerAccountID)
+	case sessionWrongDevice:
+		return fmt.Errorf("%w: session %s is bound to device %s, not %s", sentinel, sess.id, sess.deviceID, deviceID)
+	case sessionRevoked:
+		return fmt.Errorf("%w: session %s revoked", sentinel, sess.id)
+	default: // sessionExpired
+		return fmt.Errorf("%w: session %s expired at %s", sentinel, sess.id, sess.expiresAt.Format(time.RFC3339))
+	}
+}
+
+// applySessionError 把提交申请时的会话校验结果映射为对应的公开错误，错误
+// 信息说明导致失败的具体会话条件。
+func applySessionError(sess *session, in RequestInput, cond sessionCondition) error {
+	switch cond {
+	case sessionMissing:
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, in.SessionID)
+	case sessionWrongAccount:
+		return fmt.Errorf("%w: session %s belongs to account %s", ErrSessionAccountMismatch, sess.id, sess.accountID)
+	case sessionWrongDevice:
+		return fmt.Errorf("%w: session %s is bound to device %s", ErrSessionDeviceMismatch, sess.id, sess.deviceID)
+	case sessionRevoked:
+		return fmt.Errorf("%w: session %s", ErrSessionRevoked, sess.id)
+	default: // sessionExpired
+		return fmt.Errorf("%w: session %s expired at %s", ErrSessionExpired, sess.id, sess.expiresAt.Format(time.RFC3339))
+	}
 }
 
 // Apply 提交一笔代付申请。
@@ -468,22 +530,9 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 	}
 	_ = acc
 
-	sess, ok := w.sessions[in.SessionID]
-	if !ok {
-		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: %s", ErrSessionNotFound, in.SessionID))
-	}
-	if sess.accountID != in.AccountID {
-		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: session %s belongs to account %s", ErrSessionAccountMismatch, sess.id, sess.accountID))
-	}
-	if sess.deviceID != in.DeviceID {
-		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: session %s is bound to device %s", ErrSessionDeviceMismatch, sess.id, sess.deviceID))
-	}
-	if sess.revoked {
-		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: session %s", ErrSessionRevoked, sess.id))
-	}
-	// 到期时刻及之后一律视为过期：[零值, ExpiresAt) 才有效。
-	if !now.Before(sess.expiresAt) {
-		return RequestView{}, w.rejectLocked(in, now, fmt.Errorf("%w: session %s expired at %s", ErrSessionExpired, sess.id, sess.expiresAt.Format(time.RFC3339)))
+	sess, cond := w.checkSessionLocked(in.SessionID, in.AccountID, in.DeviceID, now)
+	if cond != sessionOK {
+		return RequestView{}, w.rejectLocked(in, now, applySessionError(sess, in, cond))
 	}
 
 	key := requestKey{accountID: in.AccountID, requestID: in.RequestID}
@@ -754,7 +803,7 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 	if err != nil {
 		return RequestView{}, err
 	}
-	if err := w.checkApproverLocked(req, sessionID, deviceID, now); err != nil {
+	if err := w.checkPayerSessionLocked(req.payerAccountID, sessionID, deviceID, now, ErrNotApprover); err != nil {
 		return RequestView{}, err
 	}
 	// 鉴权通过后释放已到期预留（含同一出资账户在其他策略下的预留），使
@@ -823,7 +872,7 @@ func (w *Wallet) Reject(accountID, requestID, sessionID, deviceID, reason string
 	if err != nil {
 		return RequestView{}, err
 	}
-	if err := w.checkApproverLocked(req, sessionID, deviceID, now); err != nil {
+	if err := w.checkPayerSessionLocked(req.payerAccountID, sessionID, deviceID, now, ErrNotApprover); err != nil {
 		return RequestView{}, err
 	}
 	w.refreshPendingLocked(req, now)
@@ -851,29 +900,6 @@ func (w *Wallet) Reject(accountID, requestID, sessionID, deviceID, reason string
 	default:
 		return RequestView{}, fmt.Errorf("%w: request %s is %v, cannot reject", ErrRequestNotPending, requestID, req.state)
 	}
-}
-
-// checkApproverLocked 在持锁状态下校验审批会话：必须存在、归属出资账户、
-// 绑定当前设备、未吊销且未过期。任一不满足都返回 ErrNotApprover，且不
-// 改变请求。
-func (w *Wallet) checkApproverLocked(req *request, sessionID, deviceID string, now time.Time) error {
-	sess, ok := w.sessions[sessionID]
-	if !ok {
-		return fmt.Errorf("%w: session %s", ErrNotApprover, sessionID)
-	}
-	if sess.accountID != req.payerAccountID {
-		return fmt.Errorf("%w: session %s belongs to account %s, not payer %s", ErrNotApprover, sess.id, sess.accountID, req.payerAccountID)
-	}
-	if sess.deviceID != deviceID {
-		return fmt.Errorf("%w: session %s is bound to device %s, not %s", ErrNotApprover, sess.id, sess.deviceID, deviceID)
-	}
-	if sess.revoked {
-		return fmt.Errorf("%w: session %s revoked", ErrNotApprover, sess.id)
-	}
-	if !now.Before(sess.expiresAt) {
-		return fmt.Errorf("%w: session %s expired at %s", ErrNotApprover, sess.id, sess.expiresAt.Format(time.RFC3339))
-	}
-	return nil
 }
 
 // refreshPendingLocked 在持锁状态下检查待审批请求是否已到期限；到期
