@@ -1285,6 +1285,9 @@ func buildCumulativeQuotaBackup(t *testing.T, t0 time.Time, policies []quotaPoli
 				r.WaitDeadline = timeJSON(t0.Add(ps.wait))
 			case RequestCancelled:
 				if !reservedOrigin {
+					// 待审批取消：等待截止与取消决定时刻必须是正常取消能够
+					// 产生的历史（提交于 t0，截止为提交+等待时长）。
+					r.WaitDeadline = timeJSON(t0.Add(ps.wait))
 					r.DecidedAt = timeJSON(t0)
 				}
 			}
