@@ -325,17 +325,17 @@ func TestRestoreExpiredTimingConsistentBalancesCannotPass(t *testing.T) {
 // 预留超时规则恢复。
 func TestRestoreReservationExpiredUnaffectedByExpirationTiming(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	// 未超门槛直接预留（费用 5 ≤ 门槛 10），t0+10m 预留、预留时长 2h，
-	// 截止时刻 t0+10m+2h 超时全额退回。
+	// 未超门槛直接预留（费用 5 ≤ 门槛 10），提交时刻 t0 即完成预留、预留
+	// 时长 2h，截止时刻 t0+2h 超时全额退回。
 	data := buildExpiredPendingTimingBackup(t, t0, func(r *requestBackupV1, _ *policyBackupV1, _ *sessionBackupV1) {
 		r.EstimatedFee = 5
 		r.State = int(RequestReservationExpired)
 		r.WaitDeadline = timeJSON(time.Time{})
 		r.DecidedAt = timeJSON(time.Time{})
-		r.ReservedAt = timeJSON(t0.Add(10 * time.Minute))
+		r.ReservedAt = timeJSON(t0)
 		r.ReserveDuration = durationJSON(2 * time.Hour)
-		r.ReserveDeadline = timeJSON(t0.Add(10 * time.Minute).Add(2 * time.Hour))
-		r.ReserveExpiredAt = timeJSON(t0.Add(10 * time.Minute).Add(2 * time.Hour))
+		r.ReserveDeadline = timeJSON(t0.Add(2 * time.Hour))
+		r.ReserveExpiredAt = timeJSON(t0.Add(2 * time.Hour))
 	})
 	w2, err := restoreAt(data, t0.Add(48*time.Hour))
 	if err != nil {

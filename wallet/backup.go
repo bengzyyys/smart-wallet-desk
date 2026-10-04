@@ -370,6 +370,16 @@ func addInt64(sum, x int64) (int64, bool) {
 // 预留与结算时刻，与恢复时的当前时间无关：期限内完成的结算即使很久以后恢复
 // 仍保持已结算，余额、策略已花费总额与既有账本原样保留，不追加退款或超时
 // 记录。
+// 未经审批直接受理的请求（策略关闭审批，或预估费用未严格超过审批门槛）
+// 只要曾经预留过费用（恢复时仍为已预留，或后来已结算、已取消、已预留超时），
+// 实际预留时刻还必须与提交时刻是同一瞬间：正常申请无需审批时，提交成功即
+// 同时完成费用预留。预留起点提前或推迟均拒绝，即使只差一纳秒；两种带不同
+// 时区的时间写法若表示同一绝对时刻则正常接受。关闭预留超时的策略同样适用，
+// 不允许预留起点与提交时刻脱离。该核对只针对备份记载的提交与预留时刻，与
+// 恢复时的当前时间无关：即使被篡改的预留截止时刻在恢复时已经过去，也必须
+// 整体拒绝，不能先按超时退款、再把矛盾历史当成合法备份。经大额审批后才
+// 预留的请求不受此限，其实际预留时刻为批准成功时刻、允许晚于提交时刻，
+// 由上方的审批时限核对覆盖。
 // 任一策略现存预留费用与已结算实际费用的合计严格超过其
 // 共享累计上限时同样拒绝（同一策略的多个使用账户合并计算，不同策略分别
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
@@ -1183,7 +1193,9 @@ func validateExpirationTiming(r *request, p *policy, sess *session) error {
 // 预留时长快照必须与策略一致，且审批路径（批准人、决定时间、等待期限）与
 // 费用/门槛相匹配。对所有发生过预留的状态（已预留、已结算、预留超时、
 // 已预留后取消）统一适用：超门槛的必须经出资账户在等待期限内于预留时刻
-// 批准，未超门槛的直接受理、不得携带批准人或决定时间。
+// 批准；未超门槛（或策略关闭审批）的直接受理请求不得携带批准人或决定时间，
+// 且实际预留时刻必须与提交时刻为同一瞬间——正常申请无需审批时，提交成功
+// 即同时完成费用预留，预留起点不可能早于或晚于提交时刻。
 func validateReservedOrigin(r *request, p *policy, sess *session, approvalRequired, reservedOrigin bool) error {
 	if !reservedOrigin {
 		return errors.New("request is in a reserved-origin state but missing reserved_at")
@@ -1209,6 +1221,17 @@ func validateReservedOrigin(r *request, p *policy, sess *session, approvalRequir
 		}
 		if !r.decidedAt.IsZero() {
 			return errors.New("directly reserved request must not carry decided_at")
+		}
+		// 直接受理的请求在提交成功的同一时刻完成费用预留：实际预留时刻必须
+		// 与提交时刻是同一瞬间。预留起点提前或推迟均拒绝，即使只差一纳秒——
+		// 否则被篡改的预留起点会带着与之“自洽”的预留截止一起，把本应从受理
+		// 时刻起算的预留推迟释放。时间按保存的完整绝对时刻比较（Equal）：
+		// 不同时区表示的同一时刻判定相同。关闭预留超时（时长为零）的请求同样
+		// 适用。该核对只针对备份记载的提交与预留时刻，与恢复时的当前时间无关：
+		// 即使被篡改的预留截止在恢复时已经过去，也必须拒绝，不能先按超时退款
+		// 再接受矛盾历史。
+		if !r.reservedAt.Equal(r.createdAt) {
+			return fmt.Errorf("directly reserved request reserved_at %v does not match created_at %v", r.reservedAt, r.createdAt)
 		}
 	}
 	return nil

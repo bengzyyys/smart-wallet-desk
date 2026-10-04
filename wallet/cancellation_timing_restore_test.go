@@ -268,15 +268,15 @@ func TestRestoreCancelledTimingConsistentBalancesCannotPass(t *testing.T) {
 // 规则：不适用待审批取消的时限核对，也不因缺少待审批取消的决定时间被拒绝。
 func TestRestoreReservedThenCancelledUnaffected(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	// 未超门槛直接预留（费用 5 ≤ 门槛 10），t0+10m 预留、t0+20m 取消：
+	// 未超门槛直接预留（费用 5 ≤ 门槛 10），提交时刻 t0 即完成预留、之后取消：
 	// 直接受理的请求本就不携带决定时间。
 	data := buildCancelledPendingTimingBackup(t, t0, func(r *requestBackupV1, _ *policyBackupV1, _ *sessionBackupV1) {
 		r.EstimatedFee = 5
 		r.WaitDeadline = timeJSON(time.Time{})
 		r.DecidedAt = timeJSON(time.Time{})
-		r.ReservedAt = timeJSON(t0.Add(10 * time.Minute))
+		r.ReservedAt = timeJSON(t0)
 		r.ReserveDuration = durationJSON(2 * time.Hour)
-		r.ReserveDeadline = timeJSON(t0.Add(10 * time.Minute).Add(2 * time.Hour))
+		r.ReserveDeadline = timeJSON(t0.Add(2 * time.Hour))
 	})
 	w2, err := restoreAt(data, t0.Add(48*time.Hour))
 	if err != nil {
@@ -289,7 +289,7 @@ func TestRestoreReservedThenCancelledUnaffected(t *testing.T) {
 	if r.State != RequestCancelled {
 		t.Fatalf("state = %v, want cancelled", r.State)
 	}
-	if !r.ReservedAt.Equal(t0.Add(10*time.Minute)) || !r.DecidedAt.IsZero() {
+	if !r.ReservedAt.Equal(t0) || !r.DecidedAt.IsZero() {
 		t.Fatalf("reserved-origin cancellation rewritten: %+v", r)
 	}
 	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: 100, Reserved: 0}) {
