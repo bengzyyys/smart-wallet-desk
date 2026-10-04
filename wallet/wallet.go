@@ -616,11 +616,10 @@ func (w *Wallet) Settle(accountID, requestID string, actualFee int64) (RequestVi
 	payer := w.accounts[req.payerAccountID]
 	refund := req.estimatedFee - actualFee
 
-	// 扣除实际费用、退回差额、释放共享额度。
-	payer.reserved -= req.estimatedFee
-	payer.available += refund
-	p.reservedTotal -= req.estimatedFee
-	p.spentTotal += actualFee
+	// 统一释放预留：出资账户预留余额与策略预留总额都按预估全额减少，实际
+	// 费用计入策略已花费总额，差额退回该出资账户可用余额；实际费用等于预估
+	// 时差额为零，只扣实际费用、不产生退款。
+	w.releaseReservationLocked(p, payer, req, refund, actualFee)
 
 	req.state = RequestSettled
 	req.actualFee = actualFee
@@ -688,12 +687,9 @@ func (w *Wallet) Cancel(accountID, requestID string) (RequestView, error) {
 		return RequestView{}, fmt.Errorf("%w: request %s is %v, cannot cancel", ErrRequestNotReserved, requestID, req.state)
 	}
 
-	// 已预留：退回全部预留。
+	// 已预留：取消不产生实际费用，预估费用全额退回出资账户可用余额。
 	payer := w.accounts[req.payerAccountID]
-
-	payer.reserved -= req.estimatedFee
-	payer.available += req.estimatedFee
-	p.reservedTotal -= req.estimatedFee
+	w.releaseReservationLocked(p, payer, req, req.estimatedFee, 0)
 
 	req.state = RequestCancelled
 
@@ -1042,11 +1038,9 @@ func (w *Wallet) expireReservationsLocked(now time.Time) {
 // 必须在持锁状态下调用。
 func (w *Wallet) expireReservationLocked(req *request, deadline time.Time) {
 	payer := w.accounts[req.payerAccountID]
-	payer.reserved -= req.estimatedFee
-	payer.available += req.estimatedFee
-	if p := w.policies[req.policyID]; p != nil {
-		p.reservedTotal -= req.estimatedFee
-	}
+	// 超时不产生实际费用：预估费用全额退回出资账户可用余额，不计入策略
+	// 已花费总额；释放时刻与预留截止时刻均为 deadline，与取消区分。
+	w.releaseReservationLocked(w.policies[req.policyID], payer, req, req.estimatedFee, 0)
 	req.state = RequestReservationExpired
 	req.reserveExpiredAt = deadline
 
@@ -1105,6 +1099,33 @@ func (w *Wallet) reserveFeeLocked(p *policy, payer *account, req *request, reser
 		Reason:    reason,
 		At:        reservedAt,
 	})
+}
+
+// releaseReservationLocked 一次性释放一笔已预留费用，供“结算实际费用”、
+// “取消已预留请求”与“预留超时全额退回”三个入口共用，使三种操作的资金
+// 核算遵循同一规则，避免分别维护出资账户余额与策略预留总额：
+//   - 无论结算、取消还是超时，出资账户的预留余额与该策略的预留总额都按
+//     本请求的预估费用全额减少；其他请求占用的金额保持不变；
+//   - refund 退回该出资账户的可用余额（资金始终归策略指定的出资账户，不
+//     因申请账户不同而改变），spent 计入策略已花费总额：
+//     结算时 refund=预估-实际、spent=实际（实际为零时全额退回，实际等于
+//     预估时 refund 为零）；取消与预留超时 refund=预估全额、spent=0；
+//   - 本函数只统一资金核算，不改变请求状态、终态时间或账本：状态、终态
+//     （已结算/已取消/独立的预留超时）与各自的账本记录（实际扣减、正数
+//     差额才追加的退款、超时状态记录）仍由各调用方按原内容与顺序追加。
+//
+// 账户余额、策略金额与调用方随后写入的请求状态、账本在同一把锁内连续
+// 完成，不会观察到只释放一部分的结果。p 为该请求所属策略；与超时路径
+// 原有的防御一致，策略缺失时只释放账户余额、不触碰策略总额。必须在持锁
+// 状态下调用。
+func (w *Wallet) releaseReservationLocked(p *policy, payer *account, req *request, refund, spent int64) {
+	fee := req.estimatedFee
+	payer.reserved -= fee
+	payer.available += refund
+	if p != nil {
+		p.reservedTotal -= fee
+		p.spentTotal += spent
+	}
 }
 
 // quotaWouldExceedLocked 判断在策略 p 上再计入 fee 后，共享累计合计是否
