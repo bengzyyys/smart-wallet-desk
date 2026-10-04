@@ -340,6 +340,18 @@ func addInt64(sum, x int64) (int64, bool) {
 // 因此期限内完成的合法拒绝即使恢复时会话已到期或被吊销、策略已结束或
 // 停用，仍保持已拒绝原样恢复，不追加过期记录、不产生资金变动。余额与
 // 策略累计金额核对一致也不能让时间矛盾的备份通过。
+// 备份中只要存在一笔仍处于待审批状态、且其关联策略已停用的请求，整个备份
+// 必须被拒绝：正常停用时该策略下未到等待期限的待审批请求已进入拒绝终态、
+// 已到或超过等待期限的已进入过期终态，不可能继续等待批准；否则恢复后等待
+// 期限未到的请求仍可被出资账户批准并预留费用，让本应停止代付的策略再次
+// 占用资金。错误信息指出使用账户、请求编号与策略编号，并明确说明已停用
+// 策略不能保留待审批请求。该判断只看备份保存的状态、与恢复时的当前时间
+// 无关：等待期限尚未到达、恰好到达或早已过去结论相同，不先把这笔请求自动
+// 变成过期再把备份当作合法数据接受，也不替调用方补写停用拒绝记录、清除
+// 停用标志或改写请求；同一备份中的其他策略与请求即使全部合法也不能放行。
+// 已停用策略本身及其全部合法历史请求（停用前已预留的请求，以及已经结算、
+// 取消、拒绝、过期或预留超时的请求）仍按原状态与决定信息恢复，未停用策略
+// 下的合法待审批请求不受影响，恢复后仍可继续审批、到期时按原规则过期。
 // 曾在待审批状态取消、从未预留费用的请求（已预留后再取消的沿用既有规则，
 // 不因缺少待审批取消的决定时间被拒绝）同样必须通过取消时限核对：保存的
 // 等待截止时刻必须存在，并与提交时刻加策略等待时长、策略结束时间、申请
@@ -1009,6 +1021,19 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		}
 		if r.rejectReason != "" {
 			return errors.New("pending request must not carry a reject reason")
+		}
+		// 已停用策略下不得残留待审批请求：正常停用时，该策略下未到等待期限
+		// 的待审批请求必然已进入拒绝终态、已到或超过等待期限的必然已进入
+		// 过期终态。备份同时携带“策略已停用”和“请求仍待审批”在正常流程中
+		// 不可能产生；恢复后该请求仍可能被出资账户批准并预留费用，会让本应
+		// 停止代付的策略再次占用资金。
+		//
+		// 该判断只针对备份保存的状态、与恢复时刻无关：无论等待期限尚未到达、
+		// 恰好到达还是早已过去，结果都相同；必须整体拒绝备份，不能先把这笔
+		// 请求按恢复时刻自动变成过期再把备份当作合法数据接受，也不替调用方
+		// 补写停用拒绝记录、清除停用标志或改写请求来消除矛盾。
+		if p.deactivated {
+			return fmt.Errorf("request %q/%q is still pending approval under deactivated policy %q: a deactivated policy cannot retain pending-approval requests", r.accountID, r.requestID, p.id)
 		}
 		if !r.waitDeadline.Equal(expectedWaitDeadline(r, p, sess)) {
 			return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, expectedWaitDeadline(r, p, sess))

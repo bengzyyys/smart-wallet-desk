@@ -924,6 +924,20 @@ func TestRestoreRejectsCorruptBackups(t *testing.T) {
 				}
 			}
 		}},
+		{"deactivated policy retains pending request", func(m map[string]interface{}) {
+			// p-app 下有一笔等待期限内的待审批请求 pending-due：补上自洽的
+			// 停用信息后形成“已停用策略仍保留待审批请求”的矛盾备份，其余校验
+			// （会话引用、审批门槛、等待截止、金额）全部仍然成立，也必须拒绝。
+			for _, p := range m["policies"].([]interface{}) {
+				pm := p.(map[string]interface{})
+				if pm["id"] == "p-app" {
+					pm["deactivated"] = true
+					pm["deactivated_at"] = m["exported_at"]
+					pm["deactivator_account_id"] = "payer"
+					pm["deactivate_reason"] = "stop"
+				}
+			}
+		}},
 		{"ledger references unknown policy", func(m map[string]interface{}) {
 			l := m["ledger"].([]interface{})
 			l[0].(map[string]interface{})["policy_id"] = "p-ghost"
