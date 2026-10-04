@@ -579,11 +579,8 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 		return req.view(), nil
 	}
 
-	// 受理：从出资账户可用余额中预留预估费用。
-	payer.available -= in.EstimatedFee
-	payer.reserved += in.EstimatedFee
-	p.reservedTotal += in.EstimatedFee
-
+	// 所有硬性检查通过且无需审批：直接受理。以提交时刻作为实际预留时刻，
+	// 不填写任何审批决定信息。
 	req := &request{
 		policyID:       p.id,
 		requestID:      in.RequestID,
@@ -593,20 +590,10 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 		operation:      in.Operation,
 		payee:          in.Payee,
 		estimatedFee:   in.EstimatedFee,
-		state:          RequestReserved,
 		createdAt:      now,
 	}
-	// 直接受理：从受理时刻起算最长预留时长。
-	withReserveTimingLocked(req, p, now)
+	w.reserveFeeLocked(p, payer, req, now, "reserve estimated fee")
 	w.requests[key] = req
-	w.ledger = append(w.ledger, LedgerEntry{
-		Kind:      LedgerReserve,
-		AccountID: payer.id,
-		RequestID: in.RequestID,
-		Amount:    in.EstimatedFee,
-		Reason:    "reserve estimated fee",
-		At:        now,
-	})
 	return req.view(), nil
 }
 
@@ -789,34 +776,21 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 			return RequestView{}, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
 				ErrQuotaExceeded, req.estimatedFee, p.maxTotal, used)
 		}
-		// 一次性预留全部预估费用。
-		payer.available -= req.estimatedFee
-		payer.reserved += req.estimatedFee
-		p.reservedTotal += req.estimatedFee
-
-		req.state = RequestReserved
+		// 一次性完成全部预估费用的预留（资金划转、转已预留、预留记录与从批准
+		// 成功时刻起算的预留计时）；余额或额度不足时已在上方返回，不会走到
+		// 这里，因此失败的批准不会开始计时。
+		w.reserveFeeLocked(p, payer, req, now, "reserve estimated fee on approval")
+		// 批准成功保留原提交时刻与等待截止时刻；决定时间为批准时刻，并记录
+		// 出资账户的批准决定。随后追加使用账户的零金额批准状态记录。
 		req.decidedAt = now
 		req.approverAccountID = payer.id
-		// 待审批请求：等待审批的时间不计入，从批准成功时刻起算最长预留时长。
-		withReserveTimingLocked(req, p, now)
-
-		w.ledger = append(w.ledger,
-			LedgerEntry{
-				Kind:      LedgerReserve,
-				AccountID: payer.id,
-				RequestID: req.requestID,
-				Amount:    req.estimatedFee,
-				Reason:    "reserve estimated fee on approval",
-				At:        now,
-			},
-			LedgerEntry{
-				Kind:      LedgerApproval,
-				AccountID: req.accountID,
-				RequestID: req.requestID,
-				Reason:    "approve large-amount request",
-				At:        now,
-			},
-		)
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerApproval,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "approve large-amount request",
+			At:        now,
+		})
 		return req.view(), nil
 	case RequestReserved, RequestSettled:
 		// 已批准：重复批准幂等返回，不重复预留。
@@ -1044,15 +1018,42 @@ func (w *Wallet) expireReservationLocked(req *request, deadline time.Time) {
 	)
 }
 
-// withReserveTimingLocked 在费用完成预留时写入预留计时信息：预留时刻为
-// 受理/批准成功的时刻，截止时刻为预留时刻加策略最长预留时长；策略未启用
-// 超时（时长为零）时截止时刻保持零值。必须在持锁状态下调用。
-func withReserveTimingLocked(req *request, p *policy, reservedAt time.Time) {
+// reserveFeeLocked 一次性完成一笔费用的实际预留，供“普通申请直接受理”与
+// “待审批申请被出资账户批准”两条入口共用，避免资金、请求状态与账本分别
+// 维护：
+//   - 全部预估费用从出资账户可用余额转入预留余额，并计入策略的预留总额；
+//     策略已花费总额不变，费用始终由策略指定的出资账户承担；
+//   - 请求转为已预留，并以 reservedAt 作为实际预留时刻写入预留计时
+//     （启用最长预留时长时截止时刻为 reservedAt+时长，等待审批的时间不计
+//     入；未启用时截止时刻保持零值）；
+//   - 追加一条出资账户的预留记录，金额为预估费用全额，原因由调用方给出
+//     （直接受理与批准的说明不同）。
+//
+// 资金变化、请求转为已预留与预留记录在同一次持锁调用中完成，不会观察到
+// 只完成一部分的结果。审批路径的审批决定信息（决定时间、出资账户）与
+// 使用账户零金额批准记录由 Approve 在调用本函数后另行追加，直接受理则
+// 两者都不产生。必须在持锁状态下调用，且调用前已完成余额与额度检查。
+func (w *Wallet) reserveFeeLocked(p *policy, payer *account, req *request, reservedAt time.Time, reason string) {
+	fee := req.estimatedFee
+	payer.available -= fee
+	payer.reserved += fee
+	p.reservedTotal += fee
+
+	req.state = RequestReserved
 	req.reservedAt = reservedAt
 	req.reserveDuration = p.maxReserveDuration
 	if p.maxReserveDuration > 0 {
 		req.reserveDeadline = reservedAt.Add(p.maxReserveDuration)
 	}
+
+	w.ledger = append(w.ledger, LedgerEntry{
+		Kind:      LedgerReserve,
+		AccountID: payer.id,
+		RequestID: req.requestID,
+		Amount:    fee,
+		Reason:    reason,
+		At:        reservedAt,
+	})
 }
 
 // quotaWouldExceedLocked 判断在策略 p 上再计入 fee 后，共享累计合计是否
