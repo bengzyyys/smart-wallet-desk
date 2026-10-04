@@ -323,6 +323,19 @@ func addInt64(sum, x int64) (int64, bool) {
 // 接受，恰到截止时刻批准必须拒绝）；该核对只针对备份记载的批准历史，
 // 不以恢复时的当前时间替代批准时间，因此期限内已批准的请求即使恢复时
 // 等待期限、申请会话或策略时间窗均已结束也照常恢复，不重新计时。
+// 曾经被拒绝的待审批请求（出资账户主动拒绝、申请会话在等待期限内被吊销、
+// 策略在等待期限内被停用三条路径一致；原因与决定账户的既有区别保留）还必须
+// 通过拒绝时限核对：保存的等待截止时刻必须存在且与提交时刻加策略等待时长、
+// 策略结束时间、申请会话到期时间三者的最早值一致（缺失、提前、推迟都拒绝），
+// 且拒绝决定必须不早于提交时刻（恰在提交时刻拒绝可以接受）并严格早于等待
+// 截止时刻（恰到截止时刻或更晚的处理只能产生待审批过期终态，必须拒绝）；
+// 只携带决定时间与拒绝原因、但等待期限缺失、被改写或拒绝已越过期限的备份
+// 一律拒绝，不能把请求改成过期、移动决定时间或补造一段合法期限，余额与策略
+// 累计金额核对一致也不放宽。该核对只看备份记载的申请与拒绝历史，不以恢复时
+// 的当前时间替代拒绝时间，因此期限内已完成的拒绝即使恢复时申请会话已到期或
+// 已被吊销、策略已结束或已停用也照常恢复为已拒绝，提交时间、等待期限、决定
+// 时间、原因、决定账户与既有账本原样保留，不追加过期记录或产生资金变动；
+// 未被受理申请留下的独立拒绝账本记录没有对应请求，不受此核对影响。
 // 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
 // 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
 // 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
@@ -933,6 +946,13 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if r.decidedAt.IsZero() || r.rejectReason == "" {
 			return errors.New("rejected request missing decided_at or reason")
 		}
+		// 拒绝（出资账户主动拒绝、申请会话期限内吊销、策略期限内停用）只可能
+		// 发生在等待期限之内：保存的等待截止时刻必须与三者最早值一致，决定
+		// 时刻必须不早于提交时刻且严格早于截止时刻。即使恢复时会话已到期或
+		// 被吊销、策略已结束或停用，也只核对备份记载的历史，不放宽该要求。
+		if err := validateRejectionTiming(r, p, sess); err != nil {
+			return err
+		}
 	case RequestExpired:
 		if r.decidedAt.IsZero() {
 			return errors.New("expired request missing decided_at")
@@ -1001,6 +1021,38 @@ func validateApprovalTiming(r *request, p *policy, sess *session) error {
 	}
 	if !r.decidedAt.Before(r.waitDeadline) {
 		return fmt.Errorf("approval decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
+	}
+	return nil
+}
+
+// validateRejectionTiming 校验已拒绝请求保存的等待期限与拒绝时刻自洽，防止
+// 备份中的拒绝历史绕过正常的待审批等待期限：
+//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
+//     申请会话到期时间三者的最早值，提前或推迟都拒绝；
+//   - 拒绝决定时刻必须不早于提交时刻（恰在提交时刻拒绝可以接受），且严格
+//     早于等待截止时刻：正常使用中等待期限内的待审批申请才能被拒绝，恰到
+//     截止时刻及之后的处理只能进入待审批过期终态。
+//
+// 该规则统一适用于三种拒绝来源：出资账户主动拒绝（决定账户为出资账户）、
+// 申请会话在等待期限内被吊销导致的拒绝（不填决定账户）、策略在等待期限内
+// 被停用导致的拒绝（决定账户为出资账户）；原因与决定账户的既有区别不在此
+// 限制。校验只针对备份记载的提交与拒绝历史，与恢复时的当前时间无关：期限
+// 内已完成的拒绝即使恢复时申请会话已到期或已被吊销、策略已结束或已停用，
+// 也照常恢复为已拒绝，不追加过期记录或产生资金变动。时间按保存的完整绝对
+// 时刻比较（Equal/Before），纳秒精度保留，不同时区表示的同一时刻判定相同。
+func validateRejectionTiming(r *request, p *policy, sess *session) error {
+	if r.waitDeadline.IsZero() {
+		return errors.New("rejected request missing wait deadline")
+	}
+	want := expectedWaitDeadline(r, p, sess)
+	if !r.waitDeadline.Equal(want) {
+		return fmt.Errorf("rejected wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+	}
+	if r.decidedAt.Before(r.createdAt) {
+		return fmt.Errorf("rejection decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
+	}
+	if !r.decidedAt.Before(r.waitDeadline) {
+		return fmt.Errorf("rejection decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
 	}
 	return nil
 }
