@@ -351,6 +351,18 @@ func addInt64(sum, x int64) (int64, bool) {
 // 完成的合法取消即使很久以后才恢复、申请会话已过期或吊销、策略已结束或
 // 停用，仍保持原取消状态、决定时间与账本顺序，不追加过期或退款记录，不
 // 冻结余额、不占用额度；矛盾的已取消记录不会被自动改成过期来接受备份。
+// 从未预留费用、因等待审批到期进入过期终态的请求（不包括已预留费用的预留
+// 超时）同样必须通过过期时限核对：保存的等待截止时刻必须存在，并与提交时刻
+// 加策略最长等待时长、策略结束时刻、申请会话到期时刻三者的最早值一致
+// （缺失、提前、推迟都拒绝，哪怕修改后的截止时刻仍早于所记载的过期决定；
+// 策略结束或会话到期先发生时按最早的那个时刻判断，不能只用最长等待时长），
+// 且过期决定时刻必须存在且不早于等待截止时刻（恰在截止时刻决定可以接受，
+// 严格早于它必须拒绝）。钱包可能在到期很久以后才发现请求过期，因此合法决定
+// 时刻不必等于截止时刻，恢复时不得把它改写成截止时刻或当前时间。该核对只看
+// 备份记载的申请与过期历史、与恢复时的当前时间无关：合法的过期历史即使恢复
+// 时会话已到期或被吊销、策略已结束或停用仍保持原提交时间、等待截止时间、
+// 过期决定与既有账本顺序原样恢复，不追加过期记录，也不产生预留、扣减或退款；
+// 余额与累计额度一致不能让时间矛盾的备份通过。
 // 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
 // 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
 // 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
@@ -1002,15 +1014,13 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 			return err
 		}
 	case RequestExpired:
-		if r.decidedAt.IsZero() {
-			return errors.New("expired request missing decided_at")
-		}
 		if r.rejectReason != "" {
 			return errors.New("expired request must not carry a reject reason")
 		}
-		// 惰性/停用过期的决定时刻不可能早于等待截止时刻。
-		if r.decidedAt.Before(r.waitDeadline) {
-			return errors.New("expired request decided before its wait deadline")
+		// 等待截止时刻与过期决定时刻必须沿用正常提交申请所确定的期限规则：
+		// 截止时刻必须存在且等于三者最早值，决定时刻不得早于它。
+		if err := validateExpirationTiming(r, p, sess); err != nil {
+			return err
 		}
 	case RequestReservationExpired:
 		if r.reserveDuration <= 0 {
@@ -1131,6 +1141,40 @@ func validateCancellationTiming(r *request, p *policy, sess *session) error {
 	}
 	if !r.decidedAt.Before(r.waitDeadline) {
 		return fmt.Errorf("cancellation decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
+	}
+	return nil
+}
+
+// validateExpirationTiming 校验“从未预留费用、因等待审批到期进入过期终态”的
+// 请求保存的等待期限与过期决定时刻自洽，防止备份中出现正常提交申请不可能
+// 产生的过期历史：
+//   - 等待截止时刻必须存在（缺失或被清空都拒绝），且必须等于提交时刻加策略
+//     最长等待时长、策略结束时间、申请会话到期时间三者的最早值，提前或推迟
+//     都拒绝；即使修改后的截止时刻仍早于所记载的过期决定时刻也不能接受，
+//     策略或会话更早到期时不能只按最长等待时长判断；
+//   - 过期决定时刻必须存在，且不得早于（即可以恰在）等待截止时刻：钱包可能
+//     在到期很久以后才查询并记录过期，因此合法决定时刻可以晚于截止时刻，
+//     恢复时不得将其改写为截止时刻或当前时间；严格早于截止时刻的决定在正常
+//     流程中不可能是过期（那时请求仍在等待，只能产生批准、拒绝或取消）。
+//
+// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal/Before）：
+// 纳秒精度保留，不同时区表示的同一时刻判定相同。该校验只针对备份记载的申请
+// 与过期历史，与恢复时的当前时间无关：合法的过期历史即使恢复时会话已到期或
+// 被吊销、策略已结束或停用，仍保持原提交时间、等待截止时间、过期决定与既有
+// 账本顺序恢复，不追加过期记录、不产生预留、扣减或退款。
+func validateExpirationTiming(r *request, p *policy, sess *session) error {
+	if r.waitDeadline.IsZero() {
+		return errors.New("expired request missing wait deadline")
+	}
+	want := expectedWaitDeadline(r, p, sess)
+	if !r.waitDeadline.Equal(want) {
+		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+	}
+	if r.decidedAt.IsZero() {
+		return errors.New("expired request missing decided_at")
+	}
+	if r.decidedAt.Before(r.waitDeadline) {
+		return fmt.Errorf("expiration decided_at %v is before wait deadline %v", r.decidedAt, r.waitDeadline)
 	}
 	return nil
 }
