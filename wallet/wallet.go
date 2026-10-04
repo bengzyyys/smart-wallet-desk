@@ -579,11 +579,8 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 		return req.view(), nil
 	}
 
-	// 受理：从出资账户可用余额中预留预估费用。
-	payer.available -= in.EstimatedFee
-	payer.reserved += in.EstimatedFee
-	p.reservedTotal += in.EstimatedFee
-
+	// 直接受理：以提交时刻作为实际预留时刻，一次性完成资金转移、请求转为
+	// 已预留与出资账户预留留痕；不填写任何审批决定信息。
 	req := &request{
 		policyID:       p.id,
 		requestID:      in.RequestID,
@@ -596,17 +593,8 @@ func (w *Wallet) Apply(in RequestInput) (RequestView, error) {
 		state:          RequestReserved,
 		createdAt:      now,
 	}
-	// 直接受理：从受理时刻起算最长预留时长。
-	withReserveTimingLocked(req, p, now)
 	w.requests[key] = req
-	w.ledger = append(w.ledger, LedgerEntry{
-		Kind:      LedgerReserve,
-		AccountID: payer.id,
-		RequestID: in.RequestID,
-		Amount:    in.EstimatedFee,
-		Reason:    "reserve estimated fee",
-		At:        now,
-	})
+	w.reserveFeeLocked(req, p, payer, now, "reserve estimated fee")
 	return req.view(), nil
 }
 
@@ -789,34 +777,20 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 			return RequestView{}, fmt.Errorf("%w: estimated fee %d would exceed shared total limit %d (used %d)",
 				ErrQuotaExceeded, req.estimatedFee, p.maxTotal, used)
 		}
-		// 一次性预留全部预估费用。
-		payer.available -= req.estimatedFee
-		payer.reserved += req.estimatedFee
-		p.reservedTotal += req.estimatedFee
-
-		req.state = RequestReserved
+		// 批准成功：保留原提交时刻与等待截止时刻，以批准时刻作为实际预留
+		// 时刻一次性预留全部预估费用。
+		w.reserveFeeLocked(req, p, payer, now, "reserve estimated fee on approval")
+		// 批准路径专有：填写出资账户与决定时间，并在出资账户的预留记录
+		// 之后追加使用账户的零金额批准记录。
 		req.decidedAt = now
 		req.approverAccountID = payer.id
-		// 待审批请求：等待审批的时间不计入，从批准成功时刻起算最长预留时长。
-		withReserveTimingLocked(req, p, now)
-
-		w.ledger = append(w.ledger,
-			LedgerEntry{
-				Kind:      LedgerReserve,
-				AccountID: payer.id,
-				RequestID: req.requestID,
-				Amount:    req.estimatedFee,
-				Reason:    "reserve estimated fee on approval",
-				At:        now,
-			},
-			LedgerEntry{
-				Kind:      LedgerApproval,
-				AccountID: req.accountID,
-				RequestID: req.requestID,
-				Reason:    "approve large-amount request",
-				At:        now,
-			},
-		)
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerApproval,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    "approve large-amount request",
+			At:        now,
+		})
 		return req.view(), nil
 	case RequestReserved, RequestSettled:
 		// 已批准：重复批准幂等返回，不重复预留。
@@ -1042,6 +1016,38 @@ func (w *Wallet) expireReservationLocked(req *request, deadline time.Time) {
 			At:        deadline,
 		},
 	)
+}
+
+// reserveFeeLocked 是“实际预留费用”的唯一落点，直接受理（Apply）与待审批
+// 申请被出资账户批准（Approve）两条路径共用。调用方须已通过余额与共享额度
+// 检查，并在持锁状态下调用；本方法一次性完成、外部不可能观察到只完成一部分
+// 的中间结果：
+//   - 把全部预估费用从出资账户可用余额转入预留余额；
+//   - 计入对应策略的预留总额（已花费总额不变；多个使用账户共享同一额度，
+//     额度始终按策略而非使用账户累计）；
+//   - 请求转为已预留，并以 reservedAt 作为实际预留时刻写入预留计时；
+//   - 追加一条出资账户的预留记录，金额为预估费用全额，原因由调用方给出
+//     （直接受理与批准沿用各自原有说明）。
+//
+// 两条入口的差异由调用方在本方法之外保留：直接受理以提交时刻作为
+// reservedAt 且不填写审批决定信息；批准以批准时刻作为 reservedAt，并在本
+// 方法之后补填出资账户与决定时间、追加使用账户的零金额批准记录。
+func (w *Wallet) reserveFeeLocked(req *request, p *policy, payer *account, reservedAt time.Time, reason string) {
+	payer.available -= req.estimatedFee
+	payer.reserved += req.estimatedFee
+	p.reservedTotal += req.estimatedFee
+
+	req.state = RequestReserved
+	withReserveTimingLocked(req, p, reservedAt)
+
+	w.ledger = append(w.ledger, LedgerEntry{
+		Kind:      LedgerReserve,
+		AccountID: payer.id,
+		RequestID: req.requestID,
+		Amount:    req.estimatedFee,
+		Reason:    reason,
+		At:        reservedAt,
+	})
 }
 
 // withReserveTimingLocked 在费用完成预留时写入预留计时信息：预留时刻为
