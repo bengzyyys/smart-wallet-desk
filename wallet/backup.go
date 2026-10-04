@@ -340,6 +340,14 @@ func addInt64(sum, x int64) (int64, bool) {
 // 预留与结算时刻，与恢复时的当前时间无关：期限内完成的结算即使很久以后恢复
 // 仍保持已结算，余额、策略已花费总额与既有账本原样保留，不追加退款或超时
 // 记录。
+// 每笔请求记载的提交时刻还必须通过提交时间核对：不早于关联策略的开始时刻、
+// 严格早于策略结束时刻，且严格早于申请会话的到期时刻（恰在策略开始时提交
+// 可以接受；恰在策略结束或会话到期时提交必须拒绝）。直接预留与经过审批的
+// 申请适用同一规则，后来已结算、取消、拒绝或过期的请求也不豁免；时间按
+// 备份保存的完整绝对时刻比较，纳秒与时区表示均不改变结论。该核对只看备份
+// 记载的提交历史，不以恢复时的当前时间替代：申请当时符合条件的请求，即使
+// 恢复时会话已到期或被吊销、策略已结束或停用，仍按现有规则恢复；未被受理
+// 申请留下的独立拒绝账本记录没有可关联的请求，不适用本规则，仍原样保留。
 // 任一策略现存预留费用与已结算实际费用的合计严格超过其
 // 共享累计上限时同样拒绝（同一策略的多个使用账户合并计算，不同策略分别
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
@@ -820,6 +828,12 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	if r.createdAt.IsZero() {
 		return errors.New("request missing created_at")
 	}
+	// 提交时刻必须是正常受理能够产生的历史：落在策略授权时间窗内且早于
+	// 申请会话到期时刻。直接预留与经过审批的申请、以及后来已进入任何终态
+	// 的请求统一适用。
+	if err := validateSubmissionTiming(r, p, sess); err != nil {
+		return err
+	}
 	if r.operation == "" || r.payee == "" {
 		return errors.New("operation and payee are required")
 	}
@@ -990,6 +1004,32 @@ func expectedWaitDeadline(r *request, p *policy, sess *session) time.Time {
 		want = sess.expiresAt
 	}
 	return want
+}
+
+// validateSubmissionTiming 校验请求记载的提交时刻必须是正常受理能够产生的
+// 历史，防止备份中的资金占用绕过申请时的时间条件：
+//   - 提交时刻必须不早于关联策略的开始时刻（恰在开始时刻提交可以接受），
+//     且严格早于策略结束时刻（恰在结束时刻提交必须拒绝）：策略时间窗为
+//     [StartsAt, EndsAt)，窗口外提交的申请在正常流程中不可能被受理；
+//   - 提交时刻必须严格早于申请会话的到期时刻（恰在到期时刻提交必须拒绝）：
+//     到期时刻及之后会话一律视为过期，不可能受理新申请。
+//
+// 直接预留与经过审批的申请适用同一规则；后来已结算、取消、拒绝或过期的
+// 请求也不能豁免。时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较
+// （Before）：纳秒精度保留，不同时区表示的同一时刻判定相同。该校验只针对
+// 备份记载的提交历史，与恢复时的当前时间无关：申请当时符合条件的请求，
+// 即使恢复时会话已到期或被吊销、策略已结束或停用，仍按现有规则恢复。
+func validateSubmissionTiming(r *request, p *policy, sess *session) error {
+	if r.createdAt.Before(p.startsAt) {
+		return fmt.Errorf("created_at %v is before policy %q window start %v", r.createdAt, p.id, p.startsAt)
+	}
+	if !r.createdAt.Before(p.endsAt) {
+		return fmt.Errorf("created_at %v is not strictly before policy %q window end %v", r.createdAt, p.id, p.endsAt)
+	}
+	if !r.createdAt.Before(sess.expiresAt) {
+		return fmt.Errorf("created_at %v is not strictly before session %q expiry %v", r.createdAt, sess.id, sess.expiresAt)
+	}
+	return nil
 }
 
 // validateApprovalTiming 校验“经批准后预留”的请求保存的等待期限与批准

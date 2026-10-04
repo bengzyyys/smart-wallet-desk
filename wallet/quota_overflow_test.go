@@ -49,7 +49,8 @@ func buildMaxQuotaBackup(t *testing.T, t0 time.Time, threshold, available int64)
 		Policies: []policyBackupV1{{
 			ID: "p-big", PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
 			Operation: "charge", Payee: "shop",
-			StartsAt: timeJSON(t0.Add(-time.Hour)), EndsAt: timeJSON(t0.Add(24 * time.Hour)),
+			// 窗口起点早于已结算请求的提交时刻 t0-2h，保持备份自洽。
+			StartsAt: timeJSON(t0.Add(-3 * time.Hour)), EndsAt: timeJSON(t0.Add(24 * time.Hour)),
 			MaxPerRequest:     math.MaxInt64,
 			MaxTotal:          math.MaxInt64,
 			ApprovalThreshold: threshold,
@@ -269,7 +270,8 @@ func buildApproveOverflowBackup(t *testing.T, t0 time.Time, reserveDur time.Dura
 		Policies: []policyBackupV1{{
 			ID: "p-big", PayerAccountID: "payer", AllowedAccountIDs: []string{"u1", "u2"},
 			Operation: "charge", Payee: "shop",
-			StartsAt: timeJSON(t0.Add(-time.Hour)), EndsAt: timeJSON(t0.Add(24 * time.Hour)),
+			// 窗口起点早于已结算请求的提交时刻 t0-2h，保持备份自洽。
+			StartsAt: timeJSON(t0.Add(-3 * time.Hour)), EndsAt: timeJSON(t0.Add(24 * time.Hour)),
 			MaxPerRequest:      math.MaxInt64,
 			MaxTotal:           math.MaxInt64,
 			ApprovalThreshold:  1,
