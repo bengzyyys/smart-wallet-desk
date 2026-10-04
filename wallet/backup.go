@@ -1005,7 +1005,10 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 			if r.decidedAt.IsZero() {
 				return errors.New("cancelled-from-pending request missing decided_at")
 			}
-			if err := validateCancellationTiming(r, p, sess); err != nil {
+			if err := validateWaitDeadline(r, p, sess, "cancelled-from-pending request"); err != nil {
+				return err
+			}
+			if err := validateWaitDecisionTiming(r, "cancellation"); err != nil {
 				return err
 			}
 		}
@@ -1036,8 +1039,9 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if p.deactivated {
 			return fmt.Errorf("usage account %q request %q is still pending approval under deactivated policy %q: a deactivated policy cannot retain pending-approval requests", r.accountID, r.requestID, p.id)
 		}
-		if !r.waitDeadline.Equal(expectedWaitDeadline(r, p, sess)) {
-			return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, expectedWaitDeadline(r, p, sess))
+		// 待审批没有决定时刻，只需核对保存的等待截止时刻。
+		if err := validateWaitDeadline(r, p, sess, "pending request"); err != nil {
+			return err
 		}
 	case RequestRejected:
 		if r.decidedAt.IsZero() || r.rejectReason == "" {
@@ -1045,7 +1049,10 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		}
 		// 等待截止时刻与拒绝决定时刻必须是正常审批流程能够产生的历史：
 		// 出资账户主动拒绝、申请会话吊销、策略停用三条路径统一适用。
-		if err := validateRejectionTiming(r, p, sess); err != nil {
+		if err := validateWaitDeadline(r, p, sess, "rejected request"); err != nil {
+			return err
+		}
+		if err := validateWaitDecisionTiming(r, "rejection"); err != nil {
 			return err
 		}
 	case RequestExpired:
@@ -1081,8 +1088,9 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 }
 
 // expectedWaitDeadline 计算审批路径请求的等待截止时刻：提交时刻 + 策略
-// 等待时长、策略结束时间、申请会话到期时间三者中的最早值。待审批与已批准
-// 预留的请求保存的等待截止时刻都必须与该值一致。
+// 等待时长、策略结束时间、申请会话到期时间三者中的最早值。所有走过审批
+// 流程的请求（待审批、批准、拒绝、待审批取消、待审批过期）保存的等待
+// 截止时刻都必须与该值一致。
 func expectedWaitDeadline(r *request, p *policy, sess *session) time.Time {
 	want := r.createdAt.Add(p.approvalWait)
 	if p.endsAt.Before(want) {
@@ -1094,91 +1102,46 @@ func expectedWaitDeadline(r *request, p *policy, sess *session) time.Time {
 	return want
 }
 
-// validateApprovalTiming 校验“经批准后预留”的请求保存的等待期限与批准
-// 时刻自洽，防止备份中的资金占用绕过正常审批等待期限：
-//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
-//     申请会话到期时间三者的最早值，提前或推迟都拒绝；
-//   - 批准（决定/预留）时刻必须不早于提交时刻（恰在提交时刻批准可以接受），
-//     且严格早于等待截止时刻：恰到截止时刻的批准在正常审批中不可能发生
-//     （截止时刻及之后请求只能进入待审批过期终态）。
+// validateWaitDeadline 核对审批路径请求保存的等待截止时刻自洽：不得缺失，
+// 且必须等于提交时刻+策略等待时长、策略结束时间、申请会话到期时间三者的
+// 最早值；提前或推迟都拒绝，即使决定时刻仍落在修改后的期限内。
 //
-// 该校验只针对备份记载的批准历史，与恢复时的当前时间无关：期限内已批准的
-// 请求在恢复时即使等待期限、申请会话或策略时间窗均已结束也照常恢复。
-func validateApprovalTiming(r *request, p *policy, sess *session) error {
+// whatNoun 为请求所处的审批环节名称（如 "approved request"、"rejected
+// request"、"cancelled-from-pending request"、"expired request"），用于保留
+// 各环节原有的错误措辞。待审批、批准、拒绝、待审批取消与待审批过期共用这
+// 同一条业务规则，不再分别维护。
+//
+// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal）：纳秒精度
+// 保留，不同时区表示的同一时刻判定相同。该校验只针对备份记载的历史时刻，
+// 与恢复时的当前时间无关。
+func validateWaitDeadline(r *request, p *policy, sess *session, whatNoun string) error {
 	if r.waitDeadline.IsZero() {
-		return errors.New("approved request missing wait deadline")
+		return fmt.Errorf("%s missing wait deadline", whatNoun)
 	}
-	want := expectedWaitDeadline(r, p, sess)
-	if !r.waitDeadline.Equal(want) {
+	if want := expectedWaitDeadline(r, p, sess); !r.waitDeadline.Equal(want) {
 		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
-	}
-	if r.decidedAt.Before(r.createdAt) {
-		return fmt.Errorf("approval decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
-	}
-	if !r.decidedAt.Before(r.waitDeadline) {
-		return fmt.Errorf("approval decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
 	}
 	return nil
 }
 
-// validateRejectionTiming 校验已拒绝请求保存的等待期限与拒绝决定时刻自洽，
-// 防止备份中出现正常操作不可能产生的拒绝历史：
-//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
-//     申请会话到期时间三者的最早值，提前或推迟都拒绝；
-//   - 拒绝决定时刻必须不早于提交时刻（提交当时立即拒绝可以接受），且严格
-//     早于等待截止时刻：恰到截止时刻及之后，请求只能进入待审批过期终态，
-//     任何路径都不可能再产生拒绝。
+// validateWaitDecisionTiming 核对“期限内决定”（批准、拒绝、待审批取消）
+// 共用的决定时刻规则：决定必须不早于提交时刻（恰在提交时刻决定可以接受），
+// 且严格早于等待截止时刻——决定早于提交、恰到截止时刻或晚于截止时刻都不
+// 可能在正常审批流程中产生（截止时刻及之后请求只能进入待审批过期终态）。
 //
-// 该规则对出资账户主动拒绝、申请会话吊销导致的拒绝、策略停用导致的拒绝
-// 统一适用；原因与决定账户（吊销拒绝不填写审批账户）的区别由其他校验保留。
-// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal/Before）：
-// 纳秒精度保留，不同时区表示的同一时刻判定相同。该校验只针对备份记载的
-// 申请与拒绝历史，与恢复时的当前时间无关：期限内完成的合法拒绝即使恢复时
-// 会话已到期或被吊销、策略已结束或停用，仍保持已拒绝原样恢复。
-func validateRejectionTiming(r *request, p *policy, sess *session) error {
-	if r.waitDeadline.IsZero() {
-		return errors.New("rejected request missing wait deadline")
-	}
-	want := expectedWaitDeadline(r, p, sess)
-	if !r.waitDeadline.Equal(want) {
-		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
-	}
+// actionNoun 为操作名称（"approval"、"rejection"、"cancellation"），用于保留
+// 各操作原有的错误措辞。调用方须先通过 validateWaitDeadline 确认截止时刻
+// 存在且正确，本函数不再重复该核对。时间一律按保存的完整时刻以 time.Time
+// 的绝对瞬间比较（Before）：纳秒精度保留，不同时区表示的同一时刻判定相同。
+// 该校验只针对备份记载的提交与决定历史，与恢复时的当前时间无关：期限内的
+// 合法决定即使很久以后恢复、申请会话已到期或吊销、策略已结束或停用，仍保持
+// 原状态、金额、决定信息与账本顺序，不追加退款或过期记录。
+func validateWaitDecisionTiming(r *request, actionNoun string) error {
 	if r.decidedAt.Before(r.createdAt) {
-		return fmt.Errorf("rejection decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
+		return fmt.Errorf("%s decided_at %v is before created_at %v", actionNoun, r.decidedAt, r.createdAt)
 	}
 	if !r.decidedAt.Before(r.waitDeadline) {
-		return fmt.Errorf("rejection decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
-	}
-	return nil
-}
-
-// validateCancellationTiming 校验“待审批取消”（从未预留费用）的请求保存的
-// 等待期限与取消决定时刻自洽，防止备份中出现正常取消不可能产生的历史：
-//   - 等待截止时刻不得缺失，且必须等于提交时刻+等待时长、策略结束时间、
-//     申请会话到期时间三者的最早值，提前或推迟都拒绝——即使保存的取消
-//     时间仍落在修改后的期限内；
-//   - 取消决定时刻必须不早于提交时刻（提交当时就取消可以接受），且严格
-//     早于等待截止时刻：恰到截止时刻及之后，正常流程中请求已先进入待审批
-//     过期终态，不可能再被取消。
-//
-// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（Equal/Before）：
-// 纳秒精度保留，不同时区表示的同一时刻判定相同。该校验只针对备份记载的
-// 申请与取消历史，与恢复时的当前时间无关：期限内完成的合法取消即使很久
-// 以后才恢复、申请会话已过期或吊销、策略已结束或停用，仍保持原取消状态
-// 与决定时间，不追加过期或退款记录。已预留后再取消的请求不适用本规则。
-func validateCancellationTiming(r *request, p *policy, sess *session) error {
-	if r.waitDeadline.IsZero() {
-		return errors.New("cancelled-from-pending request missing wait deadline")
-	}
-	want := expectedWaitDeadline(r, p, sess)
-	if !r.waitDeadline.Equal(want) {
-		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
-	}
-	if r.decidedAt.Before(r.createdAt) {
-		return fmt.Errorf("cancellation decided_at %v is before created_at %v", r.decidedAt, r.createdAt)
-	}
-	if !r.decidedAt.Before(r.waitDeadline) {
-		return fmt.Errorf("cancellation decided_at %v is not strictly before wait deadline %v", r.decidedAt, r.waitDeadline)
+		return fmt.Errorf("%s decided_at %v is not strictly before wait deadline %v", actionNoun, r.decidedAt, r.waitDeadline)
 	}
 	return nil
 }
@@ -1186,10 +1149,10 @@ func validateCancellationTiming(r *request, p *policy, sess *session) error {
 // validateExpirationTiming 校验“待审批过期”（从未预留费用、因等待审批到期
 // 进入已过期终态）的请求保存的等待期限与过期决定时刻自洽，防止备份中出现
 // 正常流程不可能产生的过期历史：
-//   - 等待截止时刻不得缺失，且必须等于提交时刻+策略最长等待时长、策略结束
-//     时间、申请会话到期时间三者的最早值，提前或推迟都拒绝——即使修改后的
-//     截止时刻仍早于记载的过期决定；策略结束或会话到期更早时按最早的那个
-//     时刻判断，不能只按最长等待时长；
+//   - 等待截止时刻核对与批准、拒绝、待审批取消共用同一规则（见
+//     validateWaitDeadline）：缺失、提前、推迟都拒绝，即使修改后的截止时刻
+//     仍早于记载的过期决定；策略结束或会话到期更早时按最早的那个时刻判断，
+//     不能只按最长等待时长；
 //   - 过期决定时刻必须存在，且不早于等待截止时刻：恰到截止时刻发现过期可以
 //     接受，早于它必须拒绝。钱包可能在到期很久之后才（因查询、新申请或导出）
 //     发现请求过期，因此合法决定时刻可以远晚于截止时刻，恢复时不得把它改写
@@ -1202,12 +1165,8 @@ func validateCancellationTiming(r *request, p *policy, sess *session) error {
 // 与决定时刻及既有账本顺序，不追加过期记录，不产生预留、扣减或退款。
 // 已预留费用的预留超时（RequestReservationExpired）不适用本规则。
 func validateExpirationTiming(r *request, p *policy, sess *session) error {
-	if r.waitDeadline.IsZero() {
-		return errors.New("expired request missing wait deadline")
-	}
-	want := expectedWaitDeadline(r, p, sess)
-	if !r.waitDeadline.Equal(want) {
-		return fmt.Errorf("wait deadline %v does not match min(created+wait, policy end, session expiry) %v", r.waitDeadline, want)
+	if err := validateWaitDeadline(r, p, sess, "expired request"); err != nil {
+		return err
 	}
 	if r.decidedAt.Before(r.waitDeadline) {
 		return fmt.Errorf("expiration decided_at %v is before wait deadline %v", r.decidedAt, r.waitDeadline)
@@ -1238,7 +1197,10 @@ func validateReservedOrigin(r *request, p *policy, sess *session, approvalRequir
 		}
 		// 等待截止时刻与批准时刻必须是正常审批流程能够产生的历史：即使该
 		// 预留后来已经结算、取消或超时退回，也不放宽这一要求。
-		if err := validateApprovalTiming(r, p, sess); err != nil {
+		if err := validateWaitDeadline(r, p, sess, "approved request"); err != nil {
+			return err
+		}
+		if err := validateWaitDecisionTiming(r, "approval"); err != nil {
 			return err
 		}
 	} else {
