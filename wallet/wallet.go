@@ -213,53 +213,12 @@ func (w *Wallet) RevokeSession(id string) error {
 	}
 	sess.revoked = true
 	now := w.now()
-	reason := "application session revoked before approval"
 
-	// 按等待截止时刻顺序收集本会话仍在待审批的请求（同截止时刻按使用
-	// 账户、请求编号排序），保证多笔申请分别处理时账本追加顺序确定。
-	pending := make([]*request, 0)
-	for _, req := range w.requests {
-		if req.state == RequestPendingApproval && req.sessionID == sess.id {
-			pending = append(pending, req)
-		}
-	}
-	sort.SliceStable(pending, func(i, j int) bool {
-		if pending[i].waitDeadline.Equal(pending[j].waitDeadline) {
-			if pending[i].accountID != pending[j].accountID {
-				return pending[i].accountID < pending[j].accountID
-			}
-			return pending[i].requestID < pending[j].requestID
-		}
-		return pending[i].waitDeadline.Before(pending[j].waitDeadline)
-	})
-
-	for _, req := range pending {
-		if now.Before(req.waitDeadline) {
-			// 未到等待期限：随会话吊销进入拒绝终态。
-			req.state = RequestRejected
-			req.rejectReason = reason
-			req.decidedAt = now
-			w.ledger = append(w.ledger, LedgerEntry{
-				Kind:      LedgerRejection,
-				AccountID: req.accountID,
-				RequestID: req.requestID,
-				Reason:    reason,
-				At:        now,
-			})
-			continue
-		}
-		// 已到（含恰到）或超过等待期限：进入过期终态，与惰性过期口径一致，
-		// 不带吊销拒绝原因、不填写审批账户。
-		req.state = RequestExpired
-		req.decidedAt = now
-		w.ledger = append(w.ledger, LedgerEntry{
-			Kind:      LedgerExpiration,
-			AccountID: req.accountID,
-			RequestID: req.requestID,
-			Reason:    "approval period expired",
-			At:        now,
-		})
-	}
+	// 吊销瞬间按各请求自身的等待截止时间分别结清本会话仍在待审批的请求：
+	// 严格早于截止时间的随吊销拒绝，恰到截止时间及之后的进入等待过期终态。
+	// 收集与逐笔收口都走共享逻辑，与查询惰性过期、停用策略使用同一套判定与
+	// 排序，只在原因与审批账户上保留吊销自己的口径。
+	w.settlePendingWaitsLocked(w.pendingWaitsBySessionLocked(sess.id), now, pendingWaitRevoked{})
 	return nil
 }
 
@@ -419,37 +378,12 @@ func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) 
 		At:        now,
 	})
 
-	// 停用瞬间结清该策略全部待审批请求：未到等待期限的随停用立即拒绝，
-	// 已到或超过期限的进入过期终态（不能因未被查询过而变成停用拒绝）。
-	for _, req := range w.requests {
-		if req.policyID != p.id || req.state != RequestPendingApproval {
-			continue
-		}
-		if now.Before(req.waitDeadline) {
-			msg := fmt.Sprintf("policy %s deactivated by payer: %s", p.id, reason)
-			req.state = RequestRejected
-			req.rejectReason = msg
-			req.decidedAt = now
-			req.approverAccountID = p.payerAccountID
-			w.ledger = append(w.ledger, LedgerEntry{
-				Kind:      LedgerRejection,
-				AccountID: req.accountID,
-				RequestID: req.requestID,
-				Reason:    msg,
-				At:        now,
-			})
-			continue
-		}
-		req.state = RequestExpired
-		req.decidedAt = now
-		w.ledger = append(w.ledger, LedgerEntry{
-			Kind:      LedgerExpiration,
-			AccountID: req.accountID,
-			RequestID: req.requestID,
-			Reason:    "approval period expired",
-			At:        now,
-		})
-	}
+	// 停用瞬间结清该策略全部待审批请求：未到等待期限的随停用立即拒绝（信息
+	// 说明策略被停用并包含停用理由，审批账户为出资账户），已到或超过期限的
+	// 进入等待过期终态。逐笔收口走共享逻辑，与查询惰性过期、吊销会话使用
+	// 同一套按各请求自身截止时间的判定与排序，只在原因与审批账户上保留停用
+	// 自己的口径；不能因未被查询过而把到期请求也变成停用拒绝。
+	w.settlePendingWaitsLocked(w.pendingWaitsByPolicyLocked(p.id), now, pendingWaitDeactivated{policy: p, reason: reason})
 	return p.view(), nil
 }
 
@@ -937,24 +871,171 @@ func (w *Wallet) checkApproverLocked(req *request, sessionID, deviceID string, n
 	return nil
 }
 
-// refreshPendingLocked 在持锁状态下检查待审批请求是否已到期限；到期
-// （含到期时刻）则转为过期终态并记账。必须在持锁状态下调用。
-func (w *Wallet) refreshPendingLocked(req *request, now time.Time) {
+// pendingWaitExpiredReason 是待审批请求到达等待截止时间、进入等待过期终态时
+// 统一使用的过期原因。查询惰性过期、吊销申请会话、停用所属策略与导出/恢复
+// 都共用这一文本，不因触发方式不同而变化。
+const pendingWaitExpiredReason = "approval period expired"
+
+// pendingWaitTrigger 描述“结束等待”的触发方式。三种入口都以每笔请求自己的
+// 等待截止时间为准：当前时刻严格早于截止时间时是否按触发方式拒绝，由
+// rejectEarly 区分（查询不拒绝、继续等待；吊销会话与停用策略拒绝）；恰到
+// 截止时间及之后三者统一进入等待过期终态。拒绝时写入请求与拒绝留痕的理由、
+// 审批账户由各触发方式提供，等待过期的口径三者一致。
+type pendingWaitTrigger interface {
+	// rejectEarly 表示严格早于等待截止时间时是否立即拒绝待审批请求。
+	rejectEarly() bool
+	// rejectReason 返回截止前拒绝时写入请求与拒绝留痕的理由。
+	rejectReason(req *request) string
+	// rejectApprover 返回截止前拒绝记录的审批账户；空串表示不填写。
+	rejectApprover(req *request) string
+}
+
+// pendingWaitOutcome 以请求自己的等待截止时间为准返回当前结果，不改变状态：
+// 非待审批请求返回空串；严格早于截止时间时，rejectEarly 为真返回 "reject"，
+// 否则返回空串（继续等待，不产生审批决定或过期记录）；恰到截止时间及之后
+// 返回 "expire"。终态请求一律返回空串，因此已批准预留、已拒绝、已取消、已
+// 过期等都不会被改写成等待过期。
+func pendingWaitOutcome(req *request, now time.Time, rejectEarly bool) string {
 	if req.state != RequestPendingApproval {
-		return
+		return ""
 	}
 	if now.Before(req.waitDeadline) {
-		return
+		if rejectEarly {
+			return "reject"
+		}
+		return ""
 	}
-	req.state = RequestExpired
-	req.decidedAt = now
-	w.ledger = append(w.ledger, LedgerEntry{
-		Kind:      LedgerExpiration,
-		AccountID: req.accountID,
-		RequestID: req.requestID,
-		Reason:    "approval period expired",
-		At:        now,
+	return "expire"
+}
+
+// settlePendingWaitLocked 按触发方式结清单笔待审批请求的等待：仍在等待则
+// 原样保留；截止前可拒绝的进入拒绝终态（理由与审批账户取自触发方式）；已到
+// 或超过截止时间的进入等待过期终态（拒绝理由与审批账户均为空）。决定时间
+// 一律记录本次处理时刻，提交时间与等待截止时间保持不变；账本只追加一条
+// 关联使用账户与请求编号的零金额状态记录。任何资金余额、策略预留与已花费
+// 总额都不变。必须在持锁状态下调用。
+func (w *Wallet) settlePendingWaitLocked(req *request, now time.Time, trigger pendingWaitTrigger) {
+	switch pendingWaitOutcome(req, now, trigger.rejectEarly()) {
+	case "reject":
+		req.state = RequestRejected
+		req.rejectReason = trigger.rejectReason(req)
+		req.decidedAt = now
+		// 吊销会话不填写审批账户（返回空串）；停用策略填写出资账户。
+		if approver := trigger.rejectApprover(req); approver != "" {
+			req.approverAccountID = approver
+		}
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerRejection,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    req.rejectReason,
+			At:        now,
+		})
+	case "expire":
+		// 等待过期：不带任何拒绝原因、不填写审批账户，与查询惰性过期口径一致。
+		req.state = RequestExpired
+		req.decidedAt = now
+		w.ledger = append(w.ledger, LedgerEntry{
+			Kind:      LedgerExpiration,
+			AccountID: req.accountID,
+			RequestID: req.requestID,
+			Reason:    pendingWaitExpiredReason,
+			At:        now,
+		})
+	}
+}
+
+// settlePendingWaitsLocked 按给定顺序逐笔结清待审批请求的等待。pending 通常
+// 由 pendingWaitsLocked 系列收集器按等待截止时间排好序；一次操作涉及多笔
+// 请求时，各笔只按自身的等待截止时间分别得到结果，互不影响。必须在持锁
+// 状态下调用。
+func (w *Wallet) settlePendingWaitsLocked(pending []*request, now time.Time, trigger pendingWaitTrigger) {
+	for _, req := range pending {
+		w.settlePendingWaitLocked(req, now, trigger)
+	}
+}
+
+// sortPendingWaitsLocked 按等待截止时刻排序待审批请求（同截止时刻按使用
+// 账户、请求编号排序），使多笔申请分别处理时账本追加顺序确定。三种入口共用
+// 这套原先约定的批量处理顺序。
+func sortPendingWaitsLocked(pending []*request) {
+	sort.SliceStable(pending, func(i, j int) bool {
+		if pending[i].waitDeadline.Equal(pending[j].waitDeadline) {
+			if pending[i].accountID != pending[j].accountID {
+				return pending[i].accountID < pending[j].accountID
+			}
+			return pending[i].requestID < pending[j].requestID
+		}
+		return pending[i].waitDeadline.Before(pending[j].waitDeadline)
 	})
+}
+
+// pendingWaitsLocked 收集当前仍在待审批的请求，match 为 nil 时收集全部；
+// 结果按等待截止时刻排序。必须在持锁状态下调用。
+func (w *Wallet) pendingWaitsLocked(match func(*request) bool) []*request {
+	pending := make([]*request, 0)
+	for _, req := range w.requests {
+		if req.state != RequestPendingApproval {
+			continue
+		}
+		if match != nil && !match(req) {
+			continue
+		}
+		pending = append(pending, req)
+	}
+	sortPendingWaitsLocked(pending)
+	return pending
+}
+
+// pendingWaitsBySessionLocked 收集某申请会话下仍在待审批的请求（按等待截止
+// 时刻排序），供吊销会话时逐笔结清。必须在持锁状态下调用。
+func (w *Wallet) pendingWaitsBySessionLocked(sessionID string) []*request {
+	return w.pendingWaitsLocked(func(req *request) bool { return req.sessionID == sessionID })
+}
+
+// pendingWaitsByPolicyLocked 收集某策略下仍在待审批的请求（按等待截止时刻
+// 排序），供停用策略时逐笔结清。必须在持锁状态下调用。
+func (w *Wallet) pendingWaitsByPolicyLocked(policyID string) []*request {
+	return w.pendingWaitsLocked(func(req *request) bool { return req.policyID == policyID })
+}
+
+// pendingWaitQuery 是查询、导出与恢复共用的触发方式：严格早于截止时间不
+// 产生任何决定（请求继续等待），只把已到或超过截止时间的待审批请求转为等待
+// 过期终态。
+type pendingWaitQuery struct{}
+
+func (pendingWaitQuery) rejectEarly() bool              { return false }
+func (pendingWaitQuery) rejectReason(*request) string   { return "" }
+func (pendingWaitQuery) rejectApprover(*request) string { return "" }
+
+// pendingWaitRevoked 是吊销申请会话时的触发方式：截止前拒绝说明申请会话被
+// 吊销，不填写审批账户。
+type pendingWaitRevoked struct{}
+
+func (pendingWaitRevoked) rejectEarly() bool { return true }
+func (pendingWaitRevoked) rejectReason(*request) string {
+	return "application session revoked before approval"
+}
+func (pendingWaitRevoked) rejectApprover(*request) string { return "" }
+
+// pendingWaitDeactivated 是停用所属策略时的触发方式：截止前拒绝信息说明策略
+// 被停用并包含停用理由，审批账户记录为出资账户。
+type pendingWaitDeactivated struct {
+	policy *policy
+	reason string
+}
+
+func (d pendingWaitDeactivated) rejectEarly() bool { return true }
+func (d pendingWaitDeactivated) rejectReason(*request) string {
+	return fmt.Sprintf("policy %s deactivated by payer: %s", d.policy.id, d.reason)
+}
+func (d pendingWaitDeactivated) rejectApprover(*request) string { return d.policy.payerAccountID }
+
+// refreshPendingLocked 在持锁状态下检查单笔待审批请求是否已到等待期限；到期
+// （含到期时刻）则进入过期终态并记账；严格早于截止时间时保持待审批，不产生
+// 审批决定或过期记录。必须在持锁状态下调用。
+func (w *Wallet) refreshPendingLocked(req *request, now time.Time) {
+	w.settlePendingWaitLocked(req, now, pendingWaitQuery{})
 }
 
 // refreshReservedLocked 在持锁状态下检查单笔已预留请求是否已到最长预留
@@ -971,28 +1052,11 @@ func (w *Wallet) refreshReservedLocked(req *request, now time.Time) {
 }
 
 // expirePendingApprovalsLocked 惰性结清当前全部已到等待期限（含到期时刻）
-// 的待审批请求，使它们进入过期终态并留下状态记录。按等待截止时刻顺序
-// 处理（同截止时刻按使用账户、请求编号排序），保证账本追加顺序确定。
-// 必须在持锁状态下调用。
+// 的待审批请求，使它们进入过期终态并留下状态记录。按等待截止时刻顺序处理
+// （同截止时刻按使用账户、请求编号排序），保证账本追加顺序确定；严格早于
+// 截止时间的请求继续等待、不记账。必须在持锁状态下调用。
 func (w *Wallet) expirePendingApprovalsLocked(now time.Time) {
-	due := make([]*request, 0)
-	for _, req := range w.requests {
-		if req.state == RequestPendingApproval && !now.Before(req.waitDeadline) {
-			due = append(due, req)
-		}
-	}
-	sort.SliceStable(due, func(i, j int) bool {
-		if due[i].waitDeadline.Equal(due[j].waitDeadline) {
-			if due[i].accountID != due[j].accountID {
-				return due[i].accountID < due[j].accountID
-			}
-			return due[i].requestID < due[j].requestID
-		}
-		return due[i].waitDeadline.Before(due[j].waitDeadline)
-	})
-	for _, req := range due {
-		w.refreshPendingLocked(req, now)
-	}
+	w.settlePendingWaitsLocked(w.pendingWaitsLocked(nil), now, pendingWaitQuery{})
 }
 
 // expireReservationsLocked 惰性结清当前全部已到期（含到期时刻）的预留。
