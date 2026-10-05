@@ -795,8 +795,12 @@ func validatePolicyParams(p policyBackupV1) error {
 			return errors.New("approval wait must be positive when approval is enabled")
 		}
 	}
-	if p.ApprovalWait < 0 || p.MaxReserveDuration < 0 {
-		return errors.New("durations must not be negative")
+	// 审批等待时长只在开启审批时校验：关闭审批（门槛为零）时该设置不被
+	// 使用，保存策略同样忽略它（SavePolicy 允许任意值，含负值），因此恢复
+	// 必须接受备份保存的原值（正、零、负均可），不能因为未使用的等待设置
+	// 拒绝整个钱包。最长预留时长是独立设置，即使关闭审批也不得为负。
+	if p.MaxReserveDuration < 0 {
+		return errors.New("max reserve duration must not be negative")
 	}
 	if !p.StartsAt.std().Before(p.EndsAt.std()) {
 		return errors.New("starts-at must be before ends-at")
