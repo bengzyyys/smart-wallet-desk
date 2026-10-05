@@ -383,6 +383,23 @@ func addInt64(sum, x int64) (int64, bool) {
 // 预留超时；已结算、已取消、已拒绝或已过期的请求保留原状态与决定信息；策略
 // 的首次停用时间、执行账户、理由、余额与已有账本顺序原样保留；未停用策略下
 // 的合法待审批请求仍可恢复并继续审批，到期时按原规则过期。
+// 此外，关联已停用策略的每笔已受理请求，其保存的提交时刻不得严格晚于该
+// 策略的首次停用时刻：停用后策略不再受理新申请，停用后才提交的申请只会
+// 留下不关联请求的拒绝账本记录，不可能成为已受理请求；超过审批门槛、经
+// 批准才预留费用的请求，其保存的批准时刻同样不得严格晚于首次停用时刻
+// （直接受理的请求不携带审批信息，不适用批准时刻核对）。只要存在一笔
+// 矛盾即整体拒绝恢复（错误指出使用账户、请求编号与策略编号，并说明是
+// 停用后提交还是停用后批准），哪怕该请求的等待期限、余额与额度核对完全
+// 一致。该核对对请求后来的状态一律适用：后来已结算、取消、拒绝、等待
+// 审批过期或预留超时的历史也不能绕过——后续处理时刻不是新的提交或批准
+// 时刻。提交或批准与首次停用时刻完全相同时可以接受：先完成申请或批准、
+// 再停用，二者可能共享同一个时间戳，只有严格更晚才矛盾。时间按备份保存
+// 的完整绝对时刻比较，纳秒精度保留，不同时区表示的同一时刻判定相同；
+// 该核对只针对备份记载的历史时刻，不以恢复时的当前时间替代，也不能先把
+// 相关预留按当前时间退回再接受本不合法的备份。停用前合法提交并完成预留
+// 的请求继续沿用已有行为：停用后才结算或取消的历史正常恢复，保留原状态、
+// 金额、审批信息、预留期限与已有账本，不因本核对补写停用、拒绝或退款
+// 记录。未停用策略下的请求不受此限。
 // 从未预留费用、因等待审批到期进入已过期终态的请求（已预留费用的预留超时
 // 不适用）同样必须通过过期时限核对：保存的等待截止时刻必须存在，并与提交
 // 时刻加策略最长等待时长、策略结束时间、申请会话到期时间三者的最早值一致
@@ -906,6 +923,40 @@ func validateSubmissionTiming(r *request, p *policy, sess *session) error {
 	return nil
 }
 
+// validateDeactivationTiming 校验关联已停用策略的请求，其时间线必须是正常
+// 流程能够产生的历史：策略首次停用后不再受理新申请、也不再批准待审批请求
+// （停用瞬间未到等待期限的待审批请求立即被拒绝，已到期限的进入过期终态），
+// 因此备份中关联已停用策略的每笔已受理请求：
+//   - 提交时刻不得严格晚于策略的首次停用时刻（停用后才提交的申请只会留下
+//     不关联请求的拒绝账本记录，不可能成为已受理请求）；
+//   - 超过审批门槛、经批准才预留费用的请求，其批准时刻同样不得严格晚于
+//     首次停用时刻（停用后出资账户已无法再批准）。直接受理的请求不携带
+//     审批信息，不适用批准时刻核对。
+//
+// 两项核对对请求后来的状态一律适用：已结算、已取消、被拒绝、待审批过期或
+// 预留超时的历史也不豁免——后续处理时刻不是新的提交或批准时刻。提交或批准
+// 与首次停用时刻完全相同时可以接受：先完成申请或批准、再停用，二者可能共享
+// 同一个时间戳，只有严格更晚才矛盾。时间一律按保存的完整时刻以 time.Time
+// 的绝对瞬间比较（After）：纳秒精度保留，不同时区表示的同一时刻判定相同。
+// 仍处于待审批状态的请求不适用提交时刻核对：它们已被“已停用策略不得保留
+// 待审批请求”的专项核对覆盖，由该核对给出对应的矛盾说明。
+// 该校验只针对备份记载的历史时刻，与恢复时的当前时间无关：不能先把相关预留
+// 按当前时间退回，再接受本不合法的备份。未停用策略下的请求不受此限。
+func validateDeactivationTiming(r *request, p *policy, approvalRequired bool) error {
+	if !p.deactivated {
+		return nil
+	}
+	if r.state != RequestPendingApproval && r.createdAt.After(p.deactivatedAt) {
+		return fmt.Errorf("usage account %q request %q was submitted at %v, after policy %q was first deactivated at %v: a deactivated policy cannot accept new submissions",
+			r.accountID, r.requestID, r.createdAt, p.id, p.deactivatedAt)
+	}
+	if approvalRequired && !r.reservedAt.IsZero() && r.decidedAt.After(p.deactivatedAt) {
+		return fmt.Errorf("usage account %q request %q was approved at %v, after policy %q was first deactivated at %v: a deactivated policy cannot approve requests",
+			r.accountID, r.requestID, r.decidedAt, p.id, p.deactivatedAt)
+	}
+	return nil
+}
+
 // validateRequestTimingAndState 校验请求状态与其计时/金额字段自洽，并与
 // 不可变的策略条件、申请会话保持一致，防止任意状态搭配任意时间戳的损坏
 // 备份。sess 为该请求的申请会话。
@@ -938,6 +989,12 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	// 只能来自待审批流程；其余请求只能直接预留。
 	approvalRequired := p.approvalThreshold > 0 && r.estimatedFee > p.approvalThreshold
 	reservedOrigin := !r.reservedAt.IsZero()
+
+	// 已停用策略下的请求，其提交（及经审批请求的批准）不得严格晚于策略的
+	// 首次停用时刻；对全部后续状态统一适用。
+	if err := validateDeactivationTiming(r, p, approvalRequired); err != nil {
+		return err
+	}
 
 	switch r.state {
 	case RequestReserved, RequestSettled, RequestReservationExpired:
