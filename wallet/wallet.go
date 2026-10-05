@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -257,33 +258,10 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 	if spec.ID == "" {
 		return fmt.Errorf("%w: policy id is required", ErrPolicyInvalid)
 	}
-	if spec.Operation == "" || spec.Payee == "" {
-		return fmt.Errorf("%w: operation and payee are required", ErrPolicyInvalid)
-	}
-	if spec.MaxPerRequest <= 0 || spec.MaxTotal <= 0 {
-		return fmt.Errorf("%w: limits must be positive", ErrPolicyInvalid)
-	}
-	// 审批门槛：零表示关闭；不得为负，不得超过单次上限；开启时等待时长必须为正。
-	if spec.ApprovalThreshold < 0 {
-		return fmt.Errorf("%w: approval threshold must not be negative", ErrPolicyInvalid)
-	}
-	if spec.ApprovalThreshold > 0 {
-		if spec.ApprovalThreshold > spec.MaxPerRequest {
-			return fmt.Errorf("%w: approval threshold %d exceeds per-request limit %d", ErrPolicyInvalid, spec.ApprovalThreshold, spec.MaxPerRequest)
-		}
-		if spec.ApprovalWait <= 0 {
-			return fmt.Errorf("%w: approval wait must be positive when approval is enabled", ErrPolicyInvalid)
-		}
-	}
-	// 最长预留时长：零表示关闭预留超时（保持既有行为）；不得为负。
-	if spec.MaxReserveDuration < 0 {
-		return fmt.Errorf("%w: max reserve duration must not be negative", ErrPolicyInvalid)
-	}
-	if !spec.StartsAt.Before(spec.EndsAt) {
-		return fmt.Errorf("%w: starts-at must be before ends-at", ErrPolicyInvalid)
-	}
-	if spec.PayerAccountID == "" || len(spec.AllowedAccountIDs) == 0 {
-		return fmt.Errorf("%w: payer account and at least one allowed account are required", ErrPolicyInvalid)
+	// 策略自身的参数规则与备份恢复共用同一套判断（见
+	// validatePolicySpecParams），这里只补充保存入口特有的编号与账户检查。
+	if err := validatePolicySpecParams(spec); err != nil {
+		return fmt.Errorf("%w: %v", ErrPolicyInvalid, err)
 	}
 
 	w.mu.Lock()
@@ -316,6 +294,53 @@ func (w *Wallet) SavePolicy(spec PolicySpec) error {
 		approvalThreshold:  spec.ApprovalThreshold,
 		approvalWait:       spec.ApprovalWait,
 		maxReserveDuration: spec.MaxReserveDuration,
+	}
+	return nil
+}
+
+// validatePolicySpecParams 校验策略自身的参数规则，供 SavePolicy 与备份恢复
+// 两个入口共用，避免同一套业务规则分别维护。只覆盖与钱包状态无关的参数
+// 合法性：策略编号、编号重复、账户存在性、授权账户重复列出等由各入口按
+// 各自口径另行判断（保存时重复授权账户按同一账户处理，备份则拒绝）。
+//
+// 规则与顺序固定为：必填内容 -> 正数限额 -> 审批配置 -> 最长预留时长 ->
+// 时间窗先后 -> 出资与授权账户必填。其中审批门槛与等待时长联动：门槛为零
+// 表示关闭审批，此时等待时长不被使用，任意取值（含负值）都合法并原样
+// 保留；门槛为正时等待时长必须为正，且门槛不得超过单次上限（恰好等于
+// 单次上限合法）。最长预留时长是独立设置：零表示关闭预留超时，负值始终
+// 无效，不因审批关闭而忽略。时间窗只要求开始严格早于结束，不要求策略在
+// 当前时刻有效（尚未开始或已经结束但窗口本身合法的策略均可通过）。
+//
+// 返回的错误只携带具体原因文本，包装成各入口对外的错误类别
+// （ErrPolicyInvalid / ErrBackupInvalid）由调用方负责。
+func validatePolicySpecParams(spec PolicySpec) error {
+	if spec.Operation == "" || spec.Payee == "" {
+		return errors.New("operation and payee are required")
+	}
+	if spec.MaxPerRequest <= 0 || spec.MaxTotal <= 0 {
+		return errors.New("limits must be positive")
+	}
+	// 审批门槛：零表示关闭；不得为负，不得超过单次上限；开启时等待时长必须为正。
+	if spec.ApprovalThreshold < 0 {
+		return errors.New("approval threshold must not be negative")
+	}
+	if spec.ApprovalThreshold > 0 {
+		if spec.ApprovalThreshold > spec.MaxPerRequest {
+			return fmt.Errorf("approval threshold %d exceeds per-request limit %d", spec.ApprovalThreshold, spec.MaxPerRequest)
+		}
+		if spec.ApprovalWait <= 0 {
+			return errors.New("approval wait must be positive when approval is enabled")
+		}
+	}
+	// 最长预留时长：零表示关闭预留超时（保持既有行为）；不得为负。
+	if spec.MaxReserveDuration < 0 {
+		return errors.New("max reserve duration must not be negative")
+	}
+	if !spec.StartsAt.Before(spec.EndsAt) {
+		return errors.New("starts-at must be before ends-at")
+	}
+	if spec.PayerAccountID == "" || len(spec.AllowedAccountIDs) == 0 {
+		return errors.New("payer account and at least one allowed account are required")
 	}
 	return nil
 }

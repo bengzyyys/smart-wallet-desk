@@ -776,39 +776,30 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 	return nil
 }
 
-// validatePolicyParams 校验策略条件与限额参数，规则与 SavePolicy 一致。
+// validatePolicyParams 校验备份中策略的条件与限额参数，与 SavePolicy 共用
+// validatePolicySpecParams 的同一套判断，恢复时不再单独维护一份规则。
+// 备份特有的编号、编号重复、账户存在性与授权账户重复列出检查仍由
+// restoreLocked 按恢复口径另行处理（备份中同一策略重复列出授权账户必须
+// 拒绝，不能像保存入口那样按同一账户处理）。
+//
+// 关闭审批（门槛为零）时等待时长不被使用，备份保存的原值（正、零、负
+// 均可）必须原样接受，不能因为未使用的等待设置拒绝整个钱包；最长预留
+// 时长是独立设置，即使关闭审批也不得为负——这些关系由共用的参数判断
+// 保证，与保存入口一致。
 func validatePolicyParams(p policyBackupV1) error {
-	if p.Operation == "" || p.Payee == "" {
-		return errors.New("operation and payee are required")
-	}
-	if p.MaxPerRequest <= 0 || p.MaxTotal <= 0 {
-		return errors.New("limits must be positive")
-	}
-	if p.ApprovalThreshold < 0 {
-		return errors.New("approval threshold must not be negative")
-	}
-	if p.ApprovalThreshold > 0 {
-		if p.ApprovalThreshold > p.MaxPerRequest {
-			return fmt.Errorf("approval threshold %d exceeds per-request limit %d", p.ApprovalThreshold, p.MaxPerRequest)
-		}
-		if p.ApprovalWait <= 0 {
-			return errors.New("approval wait must be positive when approval is enabled")
-		}
-	}
-	// 审批等待时长只在开启审批时校验：关闭审批（门槛为零）时该设置不被
-	// 使用，保存策略同样忽略它（SavePolicy 允许任意值，含负值），因此恢复
-	// 必须接受备份保存的原值（正、零、负均可），不能因为未使用的等待设置
-	// 拒绝整个钱包。最长预留时长是独立设置，即使关闭审批也不得为负。
-	if p.MaxReserveDuration < 0 {
-		return errors.New("max reserve duration must not be negative")
-	}
-	if !p.StartsAt.std().Before(p.EndsAt.std()) {
-		return errors.New("starts-at must be before ends-at")
-	}
-	if p.PayerAccountID == "" || len(p.AllowedAccountIDs) == 0 {
-		return errors.New("payer account and at least one allowed account are required")
-	}
-	return nil
+	return validatePolicySpecParams(PolicySpec{
+		PayerAccountID:     p.PayerAccountID,
+		AllowedAccountIDs:  p.AllowedAccountIDs,
+		Operation:          p.Operation,
+		Payee:              p.Payee,
+		StartsAt:           p.StartsAt.std(),
+		EndsAt:             p.EndsAt.std(),
+		MaxPerRequest:      p.MaxPerRequest,
+		MaxTotal:           p.MaxTotal,
+		ApprovalThreshold:  p.ApprovalThreshold,
+		ApprovalWait:       p.ApprovalWait.std(),
+		MaxReserveDuration: p.MaxReserveDuration.std(),
+	})
 }
 
 // validateRequestRef 校验请求的外键引用：账户、会话、策略均须存在；申请
