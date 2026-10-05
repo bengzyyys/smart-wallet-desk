@@ -545,7 +545,10 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		if _, dup := policyByID[p.ID]; dup {
 			return fmt.Errorf("%w: duplicate policy id %q", ErrBackupInvalid, p.ID)
 		}
-		if err := validatePolicyParams(p); err != nil {
+		// 策略自身参数规则与 SavePolicy 共用同一份判断（限额、时间窗、审批
+		// 配置、最长预留时长），再按恢复入口原有的顺序检查编号重复与账户引用；
+		// 允许账户重复列出属于备份特有要求，下方仍单独拒绝而不去重修正。
+		if err := validatePolicyParams(p.params()); err != nil {
 			return fmt.Errorf("%w: policy %q: %v", ErrBackupInvalid, p.ID, err)
 		}
 		if _, ok := accountIDs[p.PayerAccountID]; !ok {
@@ -773,41 +776,6 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 	now := w.now()
 	w.expireReservationsLocked(now)
 	w.expirePendingApprovalsLocked(now)
-	return nil
-}
-
-// validatePolicyParams 校验策略条件与限额参数，规则与 SavePolicy 一致。
-func validatePolicyParams(p policyBackupV1) error {
-	if p.Operation == "" || p.Payee == "" {
-		return errors.New("operation and payee are required")
-	}
-	if p.MaxPerRequest <= 0 || p.MaxTotal <= 0 {
-		return errors.New("limits must be positive")
-	}
-	if p.ApprovalThreshold < 0 {
-		return errors.New("approval threshold must not be negative")
-	}
-	if p.ApprovalThreshold > 0 {
-		if p.ApprovalThreshold > p.MaxPerRequest {
-			return fmt.Errorf("approval threshold %d exceeds per-request limit %d", p.ApprovalThreshold, p.MaxPerRequest)
-		}
-		if p.ApprovalWait <= 0 {
-			return errors.New("approval wait must be positive when approval is enabled")
-		}
-	}
-	// 审批等待时长只在开启审批时校验：关闭审批（门槛为零）时该设置不被
-	// 使用，保存策略同样忽略它（SavePolicy 允许任意值，含负值），因此恢复
-	// 必须接受备份保存的原值（正、零、负均可），不能因为未使用的等待设置
-	// 拒绝整个钱包。最长预留时长是独立设置，即使关闭审批也不得为负。
-	if p.MaxReserveDuration < 0 {
-		return errors.New("max reserve duration must not be negative")
-	}
-	if !p.StartsAt.std().Before(p.EndsAt.std()) {
-		return errors.New("starts-at must be before ends-at")
-	}
-	if p.PayerAccountID == "" || len(p.AllowedAccountIDs) == 0 {
-		return errors.New("payer account and at least one allowed account are required")
-	}
 	return nil
 }
 
