@@ -383,6 +383,23 @@ func addInt64(sum, x int64) (int64, bool) {
 // 预留超时；已结算、已取消、已拒绝或已过期的请求保留原状态与决定信息；策略
 // 的首次停用时间、执行账户、理由、余额与已有账本顺序原样保留；未停用策略下
 // 的合法待审批请求仍可恢复并继续审批，到期时按原规则过期。
+// 此外，已停用策略下每笔已受理请求记载的提交时刻还必须不晚于该策略的首次
+// 停用时刻：停用后策略不再受理新申请，停用之后的提交在正常流程中只会留下
+// 不关联请求的拒绝账本记录，不可能成为已受理请求。提交时刻严格晚于首次
+// 停用时刻时整份备份无效（错误指出使用账户、请求编号与策略编号，并说明是
+// 停用后提交）；恰在停用时刻提交可以接受（先完成申请、再停用，两者可能
+// 共享同一个时间戳），不能仅凭相等就拒绝。该核对对直接预留与经过审批的
+// 申请、以及所有后续状态统一适用：请求后来已经结算、取消、拒绝、等待审批
+// 过期或预留超时也不能绕过，后续处理时间不会被当成新的提交时间。对于超过
+// 审批门槛、经批准才预留费用的请求，批准时刻同样不得严格晚于首次停用时刻
+// （停用后批准同样使整份备份无效，错误说明是停用后批准）；即使申请在停用前
+// 提交、批准仍在等待期限内、余额与额度完全对得上，也不能接受停用后批准的
+// 历史。直接受理的请求仍不需要审批信息。两项核对都只依据备份保存的历史
+// 时间，按完整绝对时刻比较（纳秒精度保留，不同时区表示的同一时刻判定
+// 相同），不以恢复时的当前时间替代，也不会先把相关预留按当前时间退回、再
+// 接受原本不合法的备份。停用前合法提交并完成预留的请求继续沿用已有行为：
+// 停用后才结算或取消的历史正常恢复，恢复保留合法请求的状态、金额、审批
+// 信息、预留期限以及已有账本，不因这项核对补写停用、拒绝或退款记录。
 // 从未预留费用、因等待审批到期进入已过期终态的请求（已预留费用的预留超时
 // 不适用）同样必须通过过期时限核对：保存的等待截止时刻必须存在，并与提交
 // 时刻加策略最长等待时长、策略结束时间、申请会话到期时间三者的最早值一致
@@ -906,6 +923,31 @@ func validateSubmissionTiming(r *request, p *policy, sess *session) error {
 	return nil
 }
 
+// validateSubmissionBeforeDeactivation 校验请求记载的提交时刻不得严格晚于
+// 关联策略的首次停用时刻：策略停用后立即不再受理新申请，停用之后提交的申请
+// 在正常流程中只会留下不关联请求的拒绝账本记录，不可能成为已受理请求。因此
+// 备份中已停用策略下的每笔已受理请求，其提交时刻都必须不晚于首次停用时刻。
+// 恰在停用时刻提交可以接受：先完成申请、再停用，两者可能共享同一个时间戳，
+// 不能仅凭相等就拒绝。
+//
+// 直接预留与经过审批的申请适用同一规则；后来已经结算、取消、拒绝、等待审批
+// 过期或预留超时的请求也不豁免——后续处理时间不能被当成新的提交时间。时间
+// 一律按保存的完整时刻以 time.Time 的绝对瞬间比较（After）：纳秒精度保留，
+// 不同时区表示的同一时刻判定相同。该校验只针对备份记载的提交历史，与恢复时
+// 的当前时间无关：停用前合法提交并完成预留的请求，即使停用后才结算或取消，
+// 仍按现有规则恢复；也不能先把相关预留按当前时间退回，再接受原本不合法的
+// 备份。
+func validateSubmissionBeforeDeactivation(r *request, p *policy) error {
+	if !p.deactivated {
+		return nil
+	}
+	if r.createdAt.After(p.deactivatedAt) {
+		return fmt.Errorf("usage account %q request %q submitted at %v, after policy %q was first deactivated at %v: a deactivated policy cannot accept new submissions",
+			r.accountID, r.requestID, r.createdAt, p.id, p.deactivatedAt)
+	}
+	return nil
+}
+
 // validateRequestTimingAndState 校验请求状态与其计时/金额字段自洽，并与
 // 不可变的策略条件、申请会话保持一致，防止任意状态搭配任意时间戳的损坏
 // 备份。sess 为该请求的申请会话。
@@ -1110,6 +1152,26 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if r.rejectReason != "" {
 			return errors.New("reservation-expired request must not carry a reject reason")
 		}
+	}
+	// 提交时刻不得严格晚于关联策略的首次停用时刻：停用后策略不再受理新
+	// 申请。对直接预留与经过审批的申请、以及所有后续状态统一适用。该核对
+	// 位于状态核对之后，使“已停用策略 + 待审批请求”等更具体的矛盾仍按
+	// 原有口径报告。
+	if err := validateSubmissionBeforeDeactivation(r, p); err != nil {
+		return err
+	}
+	// 经批准才预留费用的请求，其批准时刻同样不得严格晚于策略首次停用
+	// 时刻：停用时该策略全部待审批请求已立即进入拒绝或过期终态，停用之后
+	// 不可能再批准成功。恰在停用时刻批准可以接受（先完成批准、同一时刻再
+	// 停用，两者可能共享同一个时间戳），不能仅凭相等就拒绝。即使申请在
+	// 停用前提交、批准仍在等待期限内、余额与额度完全对得上，也不能接受
+	// 停用后批准的历史。时间按保存的完整绝对时刻比较（After）：纳秒精度
+	// 保留，不同时区表示的同一时刻判定相同。该核对只针对备份记载的批准
+	// 历史，与恢复时的当前时间无关；直接受理的请求不经过审批，不适用本
+	// 核对。
+	if approvalRequired && reservedOrigin && p.deactivated && r.decidedAt.After(p.deactivatedAt) {
+		return fmt.Errorf("usage account %q request %q approved at %v, after policy %q was first deactivated at %v: a deactivated policy cannot approve pending requests",
+			r.accountID, r.requestID, r.decidedAt, p.id, p.deactivatedAt)
 	}
 	return nil
 }
