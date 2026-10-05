@@ -718,8 +718,11 @@ func (w *Wallet) Cancel(accountID, requestID string) (RequestView, error) {
 // 余额与共享剩余额度，足够才一次性预留全部预估费用并转为已预留；不足
 // 时返回具体原因，保留待审批状态，期限内可再次批准。
 //
-// 已批准并处于预留或结算状态的请求重复批准只返回当前结果，不重复预留；
-// 已拒绝、过期或取消的请求不能批准。截止时刻及之后不能批准。
+// 经出资账户批准后进入预留或已结算的请求重复批准只返回当前结果（对已有
+// 批准决定的重复确认），不重复预留；从未经过审批就直接受理的请求——审批
+// 关闭，或审批开启但预估费用低于、恰好等于门槛——即使已预留或已结算，也
+// 返回 ErrRequestNotPending，明确其未经审批直接受理，不能冒充重复批准。
+// 已拒绝、过期、取消或预留超时的请求不能批准。截止时刻及之后不能批准。
 func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (RequestView, error) {
 	if accountID == "" || requestID == "" || sessionID == "" || deviceID == "" {
 		return RequestView{}, fmt.Errorf("%w: account, request, session and device ids are required", ErrInvalidArgument)
@@ -771,8 +774,15 @@ func (w *Wallet) Approve(accountID, requestID, sessionID, deviceID string) (Requ
 		})
 		return req.view(), nil
 	case RequestReserved, RequestSettled:
-		// 已批准：重复批准幂等返回，不重复预留。
-		return req.view(), nil
+		// 只有确实经出资账户批准后才预留的请求，重复批准才是对已有批准结果
+		// 的确认：幂等返回当前结果，不重复预留、不重写首次批准账户与时刻。
+		// approverAccountID 为空说明该请求从未等待审批——审批关闭，或费用
+		// 低于、恰好等于门槛而直接受理；即使它现在已预留或已结算，也不能把
+		// 这次调用当作重复批准返回成功。
+		if req.approverAccountID != "" {
+			return req.view(), nil
+		}
+		return RequestView{}, fmt.Errorf("%w: request %s is %v but was accepted directly without approval, cannot approve", ErrRequestNotPending, requestID, req.state)
 	default:
 		return RequestView{}, fmt.Errorf("%w: request %s is %v, cannot approve", ErrRequestNotPending, requestID, req.state)
 	}

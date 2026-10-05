@@ -3,6 +3,7 @@ package wallet
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -872,6 +873,195 @@ func TestConcurrentCancelApprove(t *testing.T) {
 		}
 	} else {
 		t.Fatalf("unexpected approve err = %v", approveErr)
+	}
+}
+
+// TestApproveDirectlyReservedRequestIsNotRepeatApproval 验证批准入口返回成功
+// 必须对应一次真实批准（或对该批准结果的重复确认）：审批关闭，或审批开启但
+// 预估费用低于、恰好等于门槛时，申请直接预留，从未等待审批；这类请求无论处于
+// 已预留还是已结算，用合法出资会话调用 Approve 都必须返回 ErrRequestNotPending，
+// 错误说明明确其未经审批直接受理，且不改变任何状态、时间、金额与账本，也不再次
+// 冻结费用。真正超门槛经批准的请求重复批准（预留与结算状态）仍返回已有结果。
+func TestApproveDirectlyReservedRequestIsNotRepeatApproval(t *testing.T) {
+	// 场景 1：审批关闭，大额费用直接预留。
+	w, c := setupApproval(t)
+	off := approvalPolicy(c)
+	off.ID = "p-off"
+	off.ApprovalThreshold = 0
+	off.ApprovalWait = 0
+	if err := w.SavePolicy(off); err != nil {
+		t.Fatal(err)
+	}
+	in := approvalApply()
+	in.PolicyID = "p-off"
+	req, err := w.Apply(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.State != RequestReserved || req.ApproverAccountID != "" || !req.WaitDeadline.IsZero() {
+		t.Fatalf("approval-off request should be directly reserved without decision: %+v", req)
+	}
+
+	assertDirectApproveRejected := func(label string) {
+		t.Helper()
+		_, err := w.Approve("u1", "r1", "sa", "dev-approve")
+		if !errors.Is(err, ErrRequestNotPending) {
+			t.Fatalf("%s: err = %v, want ErrRequestNotPending", label, err)
+		}
+		if !strings.Contains(err.Error(), "without approval") {
+			t.Fatalf("%s: error should state the request was accepted without approval: %v", label, err)
+		}
+	}
+	assertDirectApproveRejected("reserved while approval off")
+
+	// 目标请求状态、提交/预留时间、决定信息保持不变。
+	got, _ := w.Request("u1", "r1")
+	if got.State != RequestReserved || got.ApproverAccountID != "" || !got.DecidedAt.IsZero() {
+		t.Fatalf("request changed after rejected approve: %+v", got)
+	}
+	if !got.ReservedAt.Equal(req.CreatedAt) || !got.ReserveDeadline.Equal(req.ReserveDeadline) {
+		t.Fatalf("reservation timing changed: got %+v", got)
+	}
+	// 余额、策略累计不重复冻结，账本不补写批准记录。
+	if bal, _ := w.Balance("payer"); bal != (Balances{Available: 80, Reserved: 20}) {
+		t.Fatalf("balance changed: %+v", bal)
+	}
+	pv, _ := w.Policy("p-off")
+	if pv.ReservedTotal != 20 || pv.SpentTotal != 0 {
+		t.Fatalf("policy totals changed: %+v", pv)
+	}
+	for _, e := range w.Ledger() {
+		if e.Kind == LedgerApproval {
+			t.Fatalf("approval ledger entry must not be backfilled: %+v", e)
+		}
+	}
+
+	// 未结算的直接预留请求仍能按原规则结算；结算后重复批准同样被拒绝，
+	// 实际费用保持不变。
+	if _, err := w.Settle("u1", "r1", 8); err != nil {
+		t.Fatalf("settle directly reserved request: %v", err)
+	}
+	assertDirectApproveRejected("settled while approval off")
+	got, _ = w.Request("u1", "r1")
+	if got.State != RequestSettled || got.ActualFee != 8 || got.ApproverAccountID != "" {
+		t.Fatalf("settled direct request changed after rejected approve: %+v", got)
+	}
+	if bal, _ := w.Balance("payer"); bal != (Balances{Available: 92, Reserved: 0}) {
+		t.Fatalf("balance after settle = %+v, want {92 0}", bal)
+	}
+
+	// 场景 2：审批开启（门槛 10），费用恰好等于门槛与低于门槛均直接预留。
+	w2, _ := setupApproval(t)
+	for _, fee := range []int64{10, 9} {
+		in := approvalApply()
+		in.RequestID = fmt.Sprintf("r-fee-%d", fee)
+		in.EstimatedFee = fee
+		if r, err := w2.Apply(in); err != nil || r.State != RequestReserved {
+			t.Fatalf("fee %d apply: view=%+v err=%v", fee, r, err)
+		}
+		if _, err := w2.Approve("u1", fmt.Sprintf("r-fee-%d", fee), "sa", "dev-approve"); !errors.Is(err, ErrRequestNotPending) {
+			t.Fatalf("fee %d approve err = %v, want ErrRequestNotPending", fee, err)
+		}
+		if r, _ := w2.Request("u1", fmt.Sprintf("r-fee-%d", fee)); r.ApproverAccountID != "" {
+			t.Fatalf("fee %d got backfilled approver: %+v", fee, r)
+		}
+	}
+
+	// 场景 3：费用 11 确实超过门槛，经出资账户批准后预留：重复批准在预留
+	// 与结算状态下都返回已有结果，首次批准账户、决定时间与预留截止不变，
+	// 余额、策略累计与账本不重复变化。
+	big := approvalApply()
+	big.RequestID = "r-big"
+	big.EstimatedFee = 11
+	if r, err := w2.Apply(big); err != nil || r.State != RequestPendingApproval {
+		t.Fatalf("fee 11 apply: view=%+v err=%v", r, err)
+	}
+	first, err := w2.Approve("u1", "r-big", "sa", "dev-approve")
+	if err != nil {
+		t.Fatalf("first approve: %v", err)
+	}
+	if first.ApproverAccountID != "payer" || first.DecidedAt.IsZero() || !first.ReservedAt.Equal(first.DecidedAt) {
+		t.Fatalf("first approval decision fields wrong: %+v", first)
+	}
+	ledgerBefore := len(w2.Ledger())
+	repeat, err := w2.Approve("u1", "r-big", "sa", "dev-approve")
+	if err != nil {
+		t.Fatalf("repeat approved-while-reserved should confirm: %v", err)
+	}
+	if repeat.ApproverAccountID != "payer" || !repeat.DecidedAt.Equal(first.DecidedAt) ||
+		!repeat.ReservedAt.Equal(first.ReservedAt) || !repeat.ReserveDeadline.Equal(first.ReserveDeadline) {
+		t.Fatalf("repeat approve rewrote first decision: first=%+v repeat=%+v", first, repeat)
+	}
+	if len(w2.Ledger()) != ledgerBefore {
+		t.Fatal("ledger grew on repeat approve")
+	}
+	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: 100 - 10 - 9 - 11, Reserved: 10 + 9 + 11}) {
+		t.Fatalf("balance changed on repeat approve: %+v", bal)
+	}
+	if _, err := w2.Settle("u1", "r-big", 11); err != nil {
+		t.Fatalf("settle approved request: %v", err)
+	}
+	if _, err := w2.Approve("u1", "r-big", "sa", "dev-approve"); err != nil {
+		t.Fatalf("repeat approved-while-settled should confirm: %v", err)
+	}
+	if r, _ := w2.Request("u1", "r-big"); r.State != RequestSettled || r.ActualFee != 11 ||
+		r.ApproverAccountID != "payer" || !r.DecidedAt.Equal(first.DecidedAt) {
+		t.Fatalf("approved-then-settled request changed on repeat approve: %+v", r)
+	}
+}
+
+// TestApproveDirectlyReservedStillChecksApproverFirst 验证身份校验次序不变：
+// 对从未等待审批、直接预留的请求，审批会话不属于出资账户、设备不符、不存在、
+// 已吊销或已到期时仍先返回 ErrNotApprover，不能因为请求无需审批而先返回状态错误。
+func TestApproveDirectlyReservedStillChecksApproverFirst(t *testing.T) {
+	w, c := setupApproval(t)
+	// 费用恰好等于门槛 10：直接预留，从未待审批。
+	in := approvalApply()
+	in.RequestID = "r-direct"
+	in.EstimatedFee = 10
+	if _, err := w.Apply(in); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		session string
+		device  string
+	}{
+		{"user account session", "s1", "dev1"},
+		{"wrong device", "sa", "wrong-device"},
+		{"unknown session", "nope", "dev-approve"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := w.Approve("u1", "r-direct", tc.session, tc.device); !errors.Is(err, ErrNotApprover) {
+				t.Fatalf("err = %v, want ErrNotApprover", err)
+			}
+		})
+	}
+
+	// 已吊销的出资会话：仍返回无权审批。
+	if err := w.RevokeSession("sa"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Approve("u1", "r-direct", "sa", "dev-approve"); !errors.Is(err, ErrNotApprover) {
+		t.Fatalf("revoked session err = %v, want ErrNotApprover", err)
+	}
+
+	// 已到期的出资会话：同样先返回无权审批。
+	if _, err := w.CreateSession("sa-exp", "payer", "dev-exp", c.t.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Approve("u1", "r-direct", "sa-exp", "dev-exp"); !errors.Is(err, ErrNotApprover) {
+		t.Fatalf("expired session err = %v, want ErrNotApprover", err)
+	}
+
+	// 请求未被这些失败调用改变，仍是可结算的直接预留。
+	if r, _ := w.Request("u1", "r-direct"); r.State != RequestReserved || r.ApproverAccountID != "" {
+		t.Fatalf("direct request changed after failed approvals: %+v", r)
+	}
+	if bal, _ := w.Balance("payer"); bal != (Balances{Available: 90, Reserved: 10}) {
+		t.Fatalf("balance changed after failed approvals: %+v", bal)
 	}
 }
 
