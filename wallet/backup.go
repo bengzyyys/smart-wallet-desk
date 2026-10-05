@@ -411,6 +411,19 @@ func addInt64(sum, x int64) (int64, bool) {
 // 申请与过期历史，与恢复时的当前时间无关，因此合法过期即使恢复时会话已
 // 到期或被吊销、策略已结束或停用，仍保持原过期状态、全部时刻与账本顺序，
 // 不追加过期记录，不产生预留、扣减或退款。
+// 已拒绝与等待审批过期两类终态在正常流程中从未预留费用、也未执行结算，
+// 因此备份中这两类请求的实际费用必须为零、结算时间必须为空：正数实际费用
+// 即使不超过预估费用也不能接受，实际费用为零但结算时间非空同样无效；两项
+// 只要有一项矛盾即整体拒绝恢复（错误指出使用账户与请求编号，并说明是未
+// 结算终态携带了实际费用还是结算时间），不返回部分恢复的钱包，也不能只
+// 跳过该记录继续恢复、或把费用清零、清除结算时间后接受。该判断只针对备份
+// 保存的请求状态与结算信息，与恢复时距离审批期限过去多久无关。出资账户
+// 主动拒绝、申请会话吊销与策略停用造成的拒绝适用同一规则，其拒绝原因与
+// 审批账户信息照常保留；拒绝或过期的决定时间是审批信息而非结算时间，不受
+// 此限。合法的拒绝与过期历史（实际费用为零、无结算时间）照常恢复，保留
+// 原状态、预估费用、提交时间、等待截止时间、决定时间与已有账本顺序；实际
+// 完成结算且实际费用为零的已结算请求仍是合法历史，保留结算时间与原有
+// 退款结果。
 // 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
 // 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
 // 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
@@ -1128,6 +1141,16 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 			return err
 		}
 	case RequestRejected:
+		// 已拒绝是未结算终态：正常流程从未预留费用、也未执行结算，因此不得
+		// 携带实际费用或结算时间——正数实际费用即使不超过预估费用也不能
+		// 接受，实际费用为零但结算时间非空同样无效。决定时间（decided_at）
+		// 是拒绝时刻，属于审批信息，不是结算时间，不受此限。
+		if r.actualFee != 0 {
+			return fmt.Errorf("rejected request carries actual fee %d but was never settled", r.actualFee)
+		}
+		if !r.settledAt.IsZero() {
+			return fmt.Errorf("rejected request carries settled_at %v but was never settled", r.settledAt)
+		}
 		if r.decidedAt.IsZero() || r.rejectReason == "" {
 			return errors.New("rejected request missing decided_at or reason")
 		}
@@ -1140,6 +1163,14 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 			return err
 		}
 	case RequestExpired:
+		// 等待审批过期同样是未结算终态：从未预留费用、也未执行结算，不得
+		// 携带实际费用或结算时间。过期决定时间是审批信息，不是结算时间。
+		if r.actualFee != 0 {
+			return fmt.Errorf("expired request carries actual fee %d but was never settled", r.actualFee)
+		}
+		if !r.settledAt.IsZero() {
+			return fmt.Errorf("expired request carries settled_at %v but was never settled", r.settledAt)
+		}
 		if r.decidedAt.IsZero() {
 			return errors.New("expired request missing decided_at")
 		}
