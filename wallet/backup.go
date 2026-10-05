@@ -411,6 +411,20 @@ func addInt64(sum, x int64) (int64, bool) {
 // 申请与过期历史，与恢复时的当前时间无关，因此合法过期即使恢复时会话已
 // 到期或被吊销、策略已结束或停用，仍保持原过期状态、全部时刻与账本顺序，
 // 不追加过期记录，不产生预留、扣减或退款。
+// 已拒绝（出资账户主动拒绝、申请会话吊销、策略停用三条路径一致）与等待
+// 审批过期这两类未结算终态从未预留过费用，也没有执行结算，因此保存的实际
+// 费用必须为零、结算时间必须为空：正数实际费用即使不超过预估费用也不能接受，
+// 实际费用为零但结算时间非空同样无效，两项只要有一项矛盾即整体拒绝恢复
+// （错误指出使用账户、请求编号，并说清是未结算终态携带了实际费用还是结算
+// 时间），哪怕账户预留余额与策略已花费总额均为零、其余引用与审批时刻均合法，
+// 即使同一备份还包含其他合法账户、策略与请求也不能只跳过该笔继续恢复，或把
+// 费用清零、清空结算时间后接受。该核对只看备份保存的请求状态与结算信息，与
+// 恢复时距离审批期限过去多久无关：恢复不会先按当前时间改变状态再接受备份。
+// 合法的拒绝与过期历史保留原状态、预估费用、提交时间、等待截止时间与决定时间
+// （决定时间不是结算时间，不因存在决定时间而被拒绝）及已有账本顺序；拒绝原因
+// 与审批账户信息照常保留。实际完成结算且实际费用为零的请求仍是合法的已结算
+// 历史（RequestSettled），保留结算时间与原有退款结果；已预留费用的预留超时
+// （RequestReservationExpired）继续按现有规则处理，均不适用本规则。
 // 曾经完成结算的请求（直接受理与批准后预留两条路径一致）还必须通过结算
 // 时刻核对：启用预留超时时，结算时刻必须不早于实际预留时刻且严格早于预留
 // 截止时刻（恰在预留完成时结算可以接受，恰到截止时刻及之后必须拒绝，实际
@@ -897,6 +911,31 @@ func validateSettlementTiming(r *request) error {
 	return nil
 }
 
+// validateUnsettledTerminalSettlement 校验“未结算终态”（已拒绝
+// RequestRejected、等待审批过期 RequestExpired）不得携带任何结算信息：这两类
+// 请求自始至终处于待审批、从未预留过费用，被拒绝或到期时既没有扣减也没有结算，
+// 因此正常流程保存的实际费用必为零、结算时间必为空。备份若带有正数实际费用
+// （即使不超过预估费用）或非空结算时间，就是正常流程不可能产生的矛盾状态——
+// 实际费用会在请求查询中显示为一笔没有对应扣减、也不占用任何余额的费用。
+//
+// 两项只要有一项矛盾即拒绝：实际费用为零但结算时间非空同样无效。拒绝或过期的
+// 决定时刻保存在独立的 decided_at 字段、与 settled_at 无关，本核对不限制决定
+// 时刻的存在。已完成结算（含实际费用为零的结算）属于 RequestSettled，不适用
+// 本规则；已预留费用的预留超时（RequestReservationExpired）由各自的既有规则
+// 覆盖。时间与金额均只看备份保存的内容，与恢复时的当前时间无关：恢复时距离
+// 审批期限过去多久都不改变结论，也不替调用方把费用清零或清空结算时间后接受。
+func validateUnsettledTerminalSettlement(r *request, stateNoun string) error {
+	if r.actualFee != 0 {
+		return fmt.Errorf("usage account %q request %q is in the %s terminal state but carries an actual fee %d: a %s request never reserves or settles funds, so its actual fee must be zero",
+			r.accountID, r.requestID, stateNoun, r.actualFee, stateNoun)
+	}
+	if !r.settledAt.IsZero() {
+		return fmt.Errorf("usage account %q request %q is in the %s terminal state but carries a settled-at time %v: a %s request never settles, so its settled_at must be empty",
+			r.accountID, r.requestID, stateNoun, r.settledAt, stateNoun)
+	}
+	return nil
+}
+
 // validateSubmissionTiming 校验请求记载的提交时刻必须是正常申请能够产生的
 // 历史：正常提交时，策略尚未开始、已经结束或申请会话已经到期的申请都会被
 // 拒绝（只留下不关联请求的拒绝账本记录），不可能进入已受理请求序列。因此
@@ -1131,6 +1170,12 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		if r.decidedAt.IsZero() || r.rejectReason == "" {
 			return errors.New("rejected request missing decided_at or reason")
 		}
+		// 已拒绝终态从未预留或结算费用：实际费用必须为零、结算时间必须为空，
+		// 正数实际费用（即使不超过预估费用）或非空结算时间都使备份自相矛盾。
+		// 拒绝决定时刻保存在 decided_at，与结算时间无关，不受此限。
+		if err := validateUnsettledTerminalSettlement(r, "rejected"); err != nil {
+			return err
+		}
 		// 等待截止时刻与拒绝决定时刻必须是正常审批流程能够产生的历史：
 		// 出资账户主动拒绝、申请会话吊销、策略停用三条路径统一适用。
 		if err := validateWaitDeadline(r, p, sess, "rejected request"); err != nil {
@@ -1145,6 +1190,11 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 		}
 		if r.rejectReason != "" {
 			return errors.New("expired request must not carry a reject reason")
+		}
+		// 等待审批过期终态从未预留或结算费用：实际费用必须为零、结算时间必须
+		// 为空；与已预留费用的预留超时（RequestReservationExpired）不同。
+		if err := validateUnsettledTerminalSettlement(r, "pending-approval-expired"); err != nil {
+			return err
 		}
 		// 等待截止时刻与过期决定时刻必须是正常到期处理能够产生的历史：
 		// 截止时刻必须等于提交时确定的期限，决定不得早于该截止时刻。
