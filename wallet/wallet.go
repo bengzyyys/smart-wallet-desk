@@ -214,7 +214,6 @@ func (w *Wallet) RevokeSession(id string) error {
 	}
 	sess.revoked = true
 	now := w.now()
-	reason := "application session revoked before approval"
 
 	pending := make([]*request, 0)
 	for _, req := range w.requests {
@@ -222,18 +221,10 @@ func (w *Wallet) RevokeSession(id string) error {
 			pending = append(pending, req)
 		}
 	}
+	// 未到等待期限：随会话吊销进入拒绝终态（固定吊销理由、不填写审批账户）；
+	// 恰到或超过期限的进入过期终态。
 	w.settlePendingLocked(pending, now, func(req *request) {
-		// 未到等待期限：随会话吊销进入拒绝终态，不填写审批账户。
-		req.state = RequestRejected
-		req.rejectReason = reason
-		req.decidedAt = now
-		w.ledger = append(w.ledger, LedgerEntry{
-			Kind:      LedgerRejection,
-			AccountID: req.accountID,
-			RequestID: req.requestID,
-			Reason:    reason,
-			At:        now,
-		})
+		w.rejectPendingLocked(req, now, sessionRevokedRejectReason, "")
 	})
 	return nil
 }
@@ -427,18 +418,9 @@ func (w *Wallet) DeactivatePolicy(policyID, sessionID, deviceID, reason string) 
 		}
 	}
 	w.settlePendingLocked(pending, now, func(req *request) {
-		msg := fmt.Sprintf("policy %s deactivated by payer: %s", p.id, reason)
-		req.state = RequestRejected
-		req.rejectReason = msg
-		req.decidedAt = now
-		req.approverAccountID = p.payerAccountID
-		w.ledger = append(w.ledger, LedgerEntry{
-			Kind:      LedgerRejection,
-			AccountID: req.accountID,
-			RequestID: req.requestID,
-			Reason:    msg,
-			At:        now,
-		})
+		// 未到等待期限：随停用立即拒绝，理由说明策略被停用并包含（已去除
+		// 首尾空白的）停用理由，审批账户记为出资账户。
+		w.rejectPendingLocked(req, now, policyDeactivatedRejectReason(p.id, reason), p.payerAccountID)
 	})
 	return p.view(), nil
 }
@@ -826,18 +808,9 @@ func (w *Wallet) Reject(accountID, requestID, sessionID, deviceID, reason string
 
 	switch req.state {
 	case RequestPendingApproval:
-		req.state = RequestRejected
-		req.rejectReason = reason
-		req.decidedAt = now
-		req.approverAccountID = req.payerAccountID
-
-		w.ledger = append(w.ledger, LedgerEntry{
-			Kind:      LedgerRejection,
-			AccountID: req.accountID,
-			RequestID: req.requestID,
-			Reason:    reason,
-			At:        now,
-		})
+		// 出资账户主动拒绝：调用方理由原样保存（含首尾空白但非全空白），
+		// 审批账户记为出资账户。
+		w.rejectPendingLocked(req, now, reason, req.payerAccountID)
 		return req.view(), nil
 	case RequestRejected:
 		if req.rejectReason == reason {
@@ -973,6 +946,46 @@ func (w *Wallet) expirePendingLocked(req *request, now time.Time) {
 		RequestID: req.requestID,
 		Reason:    "approval period expired",
 		At:        now,
+	})
+}
+
+// sessionRevokedRejectReason 是申请会话在等待期限内被吊销时，请求拒绝原因
+// 与对应拒绝账本记录统一使用的固定说明。
+const sessionRevokedRejectReason = "application session revoked before approval"
+
+// policyDeactivatedRejectReason 生成策略在等待期限内被停用时请求的拒绝原因：
+// 说明策略被停用并包含停用理由（停用理由在 DeactivatePolicy 入口已按去掉
+// 首尾空白后的内容保存与比较）。请求上的原因文本与拒绝账本记录共用同一结果。
+func policyDeactivatedRejectReason(policyID, deactivateReason string) string {
+	return fmt.Sprintf("policy %s deactivated by payer: %s", policyID, deactivateReason)
+}
+
+// rejectPendingLocked 将一笔仍处于待审批的请求转为拒绝终态，供三条进入拒绝
+// 终态的操作共用同一套业务规则，避免拒绝状态、决定信息与拒绝账本分别维护：
+//   - 请求转为 RequestRejected，拒绝原因原样写入并作为决定时刻 at；原提交
+//     时间、等待截止时间与申请内容保持不变；待审批本就没有冻结费用，因此不
+//     改变出资账户余额或策略预留/已花费累计，也不产生预留、扣减或退款记录；
+//   - approver 记录作出该拒绝决定的审批账户：出资账户主动拒绝或随策略停用
+//     拒绝时为出资账户，随申请会话吊销拒绝时为空字符串；
+//   - 账本只追加一条 LedgerRejection：金额为零，关联发起申请的使用账户与
+//     请求编号，原因与请求上的拒绝原因完全一致。
+//
+// 三种操作的理由文本差异由调用方按各自公开规则给出，本函数不做裁剪：主动
+// 拒绝保留调用方传入的非空白原文（含首尾空白），吊销使用固定说明，停用
+// 传入已去除首尾空白的停用理由拼出的说明。是否已到等待截止时刻（届时应进入
+// 过期终态而非拒绝）由调用方经 refreshPendingLocked / settlePendingLocked
+// 判断，本函数只处理确定要拒绝的请求。必须在持锁状态下调用。
+func (w *Wallet) rejectPendingLocked(req *request, at time.Time, reason, approver string) {
+	req.state = RequestRejected
+	req.rejectReason = reason
+	req.decidedAt = at
+	req.approverAccountID = approver
+	w.ledger = append(w.ledger, LedgerEntry{
+		Kind:      LedgerRejection,
+		AccountID: req.accountID,
+		RequestID: req.requestID,
+		Reason:    reason,
+		At:        at,
 	})
 }
 
