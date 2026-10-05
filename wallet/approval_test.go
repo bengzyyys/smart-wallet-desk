@@ -778,6 +778,104 @@ func TestAccountLedgerLinksUsageAccount(t *testing.T) {
 	}
 }
 
+func TestApproveDirectlyReservedReturnsNotPending(t *testing.T) {
+	w, c := setupApproval(t)
+	// 关闭审批的策略：费用 20 也直接预留。
+	off := approvalPolicy(c)
+	off.ID = "p-off"
+	off.ApprovalThreshold = 0
+	off.ApprovalWait = 0
+	if err := w.SavePolicy(off); err != nil {
+		t.Fatal(err)
+	}
+
+	// 费用恰好等于门槛（10）：直接预留，不进入待审批。
+	eq := approvalApply()
+	eq.RequestID = "r-eq"
+	eq.EstimatedFee = 10
+	if _, err := w.Apply(eq); err != nil {
+		t.Fatal(err)
+	}
+	// 费用低于门槛（9）：直接预留并随后结算。
+	low := approvalApply()
+	low.RequestID = "r-low"
+	low.EstimatedFee = 9
+	if _, err := w.Apply(low); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Settle("u1", "r-low", 9); err != nil {
+		t.Fatal(err)
+	}
+	// 关闭审批的策略：直接预留。
+	disabled := approvalApply()
+	disabled.PolicyID = "p-off"
+	disabled.RequestID = "r-off"
+	if _, err := w.Apply(disabled); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rid := range []string{"r-eq", "r-low", "r-off"} {
+		before := len(w.Ledger())
+		viewBefore, err := w.Request("u1", rid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 未经审批直接受理的请求不能批准：即使已预留或已结算，
+		// 也返回 ErrRequestNotPending 而不是伪装成重复批准成功。
+		if _, err := w.Approve("u1", rid, "sa", "dev-approve"); !errors.Is(err, ErrRequestNotPending) {
+			t.Fatalf("approve directly-accepted %s err = %v, want ErrRequestNotPending", rid, err)
+		}
+		// 状态、时间与决定信息保持不变，账本不增长。
+		viewAfter, _ := w.Request("u1", rid)
+		if viewAfter != viewBefore {
+			t.Fatalf("%s view changed by failed approve: %+v -> %+v", rid, viewBefore, viewAfter)
+		}
+		if len(w.Ledger()) != before {
+			t.Fatalf("%s ledger grew on failed approve", rid)
+		}
+	}
+	// 余额与策略累计不因这些调用变化：r-eq 预留 10、r-low 结算 9、
+	// r-off 预留 20。
+	bal, _ := w.Balance("payer")
+	if bal != (Balances{Available: 61, Reserved: 30}) {
+		t.Fatalf("balance = %+v, want {61 30}", bal)
+	}
+
+	// 身份校验次序不变：直接受理的请求用无效会话调用仍先返回无权审批。
+	if _, err := w.Approve("u1", "r-eq", "s1", "dev1"); !errors.Is(err, ErrNotApprover) {
+		t.Fatalf("bad approver session err = %v, want ErrNotApprover", err)
+	}
+
+	// 对照：真正超过门槛（11）的请求经批准后，重复批准仍幂等返回。
+	over := approvalApply()
+	over.RequestID = "r-over"
+	over.EstimatedFee = 11
+	if _, err := w.Apply(over); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Approve("u1", "r-over", "sa", "dev-approve"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := w.Approve("u1", "r-over", "sa", "dev-approve")
+	if err != nil {
+		t.Fatalf("repeat approve of approved request: %v", err)
+	}
+	if first.State != RequestReserved || first.ApproverAccountID != "payer" {
+		t.Fatalf("repeat approve view = %+v", first)
+	}
+	// 结算后重复批准仍返回已有结果。
+	if _, err := w.Settle("u1", "r-over", 11); err != nil {
+		t.Fatal(err)
+	}
+	settled, err := w.Approve("u1", "r-over", "sa", "dev-approve")
+	if err != nil {
+		t.Fatalf("repeat approve of settled approved request: %v", err)
+	}
+	if settled.State != RequestSettled || settled.ApproverAccountID != "payer" {
+		t.Fatalf("settled repeat approve view = %+v", settled)
+	}
+}
+
 func TestConcurrentApproveReject(t *testing.T) {
 	w, _ := setupApproval(t)
 	if _, err := w.Apply(approvalApply()); err != nil {
