@@ -1171,9 +1171,22 @@ func quotaWouldExceedLocked(p *policy, fee int64) (used int64, exceed bool) {
 	return used, total > p.maxTotal
 }
 
-// Request 查询某使用账户下的代付请求。待审批请求到期即转为过期终态，
-// 已预留请求到最长预留时长即转为预留超时终态，查询结果反映最新状态；
-// 超时释放时间记录的是截止时刻本身，而不是本次查询时刻。
+// Request 查询某使用账户下的代付请求。
+//
+// 只要请求存在（同号请求按使用账户分别识别），返回其当前状态之前会先结清
+// 钱包内截至本次查询时刻已到期（含截止时刻本身）的全部费用预留：范围包括
+// 其他使用账户、其他策略以及其他出资账户下的已到期预留，与余额、账本查询
+// 一次处理全部到期预留的行为一致。同一次发现的到期预留按各自预留截止时刻
+// 从早到晚处理，截止时刻相同按使用账户、请求编号升序；每笔全额退回其策略
+// 指定的出资账户，账户预留余额与所属策略预留总额同步减少，不增加实际费用
+// 与已花费总额，账本在原历史末尾追加该笔的全额退款与零金额超时记录，释放
+// 时间仍是原截止时刻。被查询请求也可以尚未到预留期限、未启用预留超时、处于
+// 待审批或已进入终态：它自身仍按原有规则返回（待审批按自己的等待期限转为
+// 待审批或过期，不提前退款，终态不被改写），但仍触发其他到期预留的释放。
+// 请求不存在时返回 ErrRequestNotFound，失败查询不改变任何预留。
+//
+// 待审批请求到期即转为过期终态；已预留请求到最长预留时长即转为预留超时
+// 终态，超时释放时间记录的是截止时刻本身，而不是本次查询时刻。
 func (w *Wallet) Request(accountID, requestID string) (RequestView, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1183,6 +1196,10 @@ func (w *Wallet) Request(accountID, requestID string) (RequestView, error) {
 		return RequestView{}, err
 	}
 	now := w.now()
+	// 先结清钱包内全部已到期预留（含其他使用账户、其他策略、其他出资账户
+	// 下的预留），再处理被查询请求自身的状态，使到期记录先后不再取决于先查
+	// 哪一笔。被查询的待审批请求仍按自己的等待期限返回待审批或过期。
+	w.expireReservationsLocked(now)
 	w.refreshPendingLocked(req, now)
 	w.refreshReservedLocked(req, now)
 	return req.view(), nil
