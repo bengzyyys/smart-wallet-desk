@@ -1567,19 +1567,20 @@ func TestRestoreAcceptsCumulativeQuotaAtBoundary(t *testing.T) {
 // 预留后取消、预留超时的请求都不占用；结算退回的差额也不计入已花费。
 func TestRestoreCumulativeQuotaIgnoresNonOccupyingStates(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	// 累计上限仅 10：一笔实际费用 10 的已结算请求占满额度；其余请求费用均
-	// 为 30（待审批系严格超过门槛 10），但都不占用额度，备份仍合法。
+	// 累计上限仅 10：一笔实际费用 10 的已结算请求占满额度；其余请求预估费用
+	// 均为 10（待审批系严格超过门槛 5，且恰等于累计上限），但都不占用额度，
+	// 备份仍合法。
 	data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
-		id: "p-free", per: 100, total: 10, threshold: 10,
+		id: "p-free", per: 100, total: 10, threshold: 5,
 		wait: 5 * time.Minute, reserveDur: time.Minute,
 		reqs: []quotaReqSpec{
 			{id: "settled", account: "u1", estFee: 10, actualFee: 10, state: RequestSettled},
 			{id: "reserved-cancelled", account: "u1", estFee: 10, state: RequestCancelled, wasReserved: true},
 			{id: "reservation-expired", account: "u1", estFee: 10, state: RequestReservationExpired},
-			{id: "pending", account: "u1", estFee: 30, state: RequestPendingApproval},
-			{id: "rejected", account: "u1", estFee: 30, state: RequestRejected, rejectReason: "no"},
-			{id: "pending-expired", account: "u1", estFee: 30, state: RequestExpired},
-			{id: "pending-cancelled", account: "u1", estFee: 30, state: RequestCancelled},
+			{id: "pending", account: "u1", estFee: 10, state: RequestPendingApproval},
+			{id: "rejected", account: "u1", estFee: 10, state: RequestRejected, rejectReason: "no"},
+			{id: "pending-expired", account: "u1", estFee: 10, state: RequestExpired},
+			{id: "pending-cancelled", account: "u1", estFee: 10, state: RequestCancelled},
 		},
 	}})
 	w2, err := restoreAt(data, t0)
@@ -1593,6 +1594,108 @@ func TestRestoreCumulativeQuotaIgnoresNonOccupyingStates(t *testing.T) {
 	}
 	if bal, _ := w2.Balance("payer"); bal != (Balances{Available: 0, Reserved: 0}) {
 		t.Fatalf("payer balance = %+v, want zero reserved", bal)
+	}
+}
+
+// TestRestoreRejectsEstimatedFeeAboveCumulativeLimit 验证：每笔已保存请求的
+// 预估费用都不得超过关联策略的完整累计上限——正常受理时现存占用非负，预估
+// 费用严格超过累计上限的申请在受理前就会被拒绝，不可能成为已保存的请求。
+// 不论请求后来处于什么状态（仍待审批、被拒绝、取消、过期、预留超时，或曾
+// 预留后按较低实际费用结算），只要预估费用严格超过累计上限，整个备份必须
+// 被拒绝，不能跳过该请求或部分恢复。
+func TestRestoreRejectsEstimatedFeeAboveCumulativeLimit(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		req       quotaReqSpec
+		restoreAt time.Time
+	}{
+		// 题述场景：累计上限 10、单次上限 100、审批门槛 10，预估费用 30 的
+		// 待审批请求正常流程不可能产生。
+		{name: "pending", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestPendingApproval}, restoreAt: t0},
+		{name: "rejected", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestRejected, rejectReason: "no"}, restoreAt: t0},
+		{name: "pending expired", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestExpired}, restoreAt: t0},
+		{name: "pending cancelled", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestCancelled}, restoreAt: t0},
+		{name: "reserved", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestReserved}, restoreAt: t0},
+		// 曾预留 30、最终只扣减 10 的已结算历史同样不可能产生。
+		{name: "settled at lower actual fee", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, actualFee: 10, state: RequestSettled}, restoreAt: t0},
+		{name: "reserved then cancelled", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestCancelled, wasReserved: true}, restoreAt: t0},
+		{name: "reservation expired", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestReservationExpired}, restoreAt: t0},
+		// 等待期限已过也不能先自动处理到期再接受矛盾备份。
+		{name: "pending past wait deadline", req: quotaReqSpec{id: "req", account: "u1", estFee: 30, state: RequestPendingApproval}, restoreAt: t0.Add(time.Hour)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+				id: "p-lim", per: 100, total: 10, threshold: 10,
+				wait: 5 * time.Minute, reserveDur: time.Minute,
+				reqs: []quotaReqSpec{tc.req},
+			}})
+			w2, err := restoreAt(data, tc.restoreAt)
+			if err == nil {
+				if w2 != nil {
+					t.Fatalf("backup with estimated fee above cumulative limit restored a wallet")
+				}
+				t.Fatalf("backup with estimated fee above cumulative limit restored without error")
+			}
+			if !errors.Is(err, ErrBackupInvalid) {
+				t.Fatalf("err = %v, want ErrBackupInvalid", err)
+			}
+			msg := err.Error()
+			for _, want := range []string{`"u1"`, `"req"`, `"p-lim"`, "30", "10", "cumulative total limit"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q must contain %s (usage account, request id, policy id, estimated fee, cumulative limit)", msg, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRestoreAcceptsEstimatedFeeAtCumulativeLimit 验证预估费用恰等于累计上限
+// 合法；且比较的是策略保存的完整累计上限而非恢复时的剩余额度：累计上限 50
+// 的策略下，历史请求预估 40、最终扣减 10，另有一笔预留 40，当前占用恰为
+// 50，仍可恢复；已经退回的历史预估费用合计超过上限也不因此拒绝。
+func TestRestoreAcceptsEstimatedFeeAtCumulativeLimit(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 预估费用恰等于累计上限 10 的待审批请求可以恢复。
+	data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-eq", per: 100, total: 10, threshold: 5,
+		wait: 5 * time.Minute, reserveDur: time.Minute,
+		reqs: []quotaReqSpec{
+			{id: "pending", account: "u1", estFee: 10, state: RequestPendingApproval},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("estimated fee equal to cumulative limit must restore: %v", err)
+	}
+
+	// 占用恰为 50（已花费 10 + 现存预留 40）：历史预估 40 不得再计入。
+	data = buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-full", per: 100, total: 50, threshold: 5,
+		wait: 5 * time.Minute, reserveDur: time.Minute,
+		reqs: []quotaReqSpec{
+			{id: "settled", account: "u1", estFee: 40, actualFee: 10, state: RequestSettled},
+			{id: "reserved", account: "u1", estFee: 40, state: RequestReserved},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("settled 40->10 plus reserved 40 under limit 50 must restore: %v", err)
+	}
+
+	// 两笔预估各 10 的预留超时历史：已退回的预估费用合计 20 超过上限 10，
+	// 但都不占用额度，不能仅因此拒绝。
+	data = buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
+		id: "p-refunded", per: 100, total: 10, threshold: 5,
+		wait: 5 * time.Minute, reserveDur: time.Minute,
+		reqs: []quotaReqSpec{
+			{id: "expired-1", account: "u1", estFee: 10, state: RequestReservationExpired},
+			{id: "expired-2", account: "u1", estFee: 10, state: RequestReservationExpired},
+		},
+	}})
+	if _, err := restoreAt(data, t0); err != nil {
+		t.Fatalf("refunded historical estimates above the limit in sum must restore: %v", err)
 	}
 }
 

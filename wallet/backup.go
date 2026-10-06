@@ -448,6 +448,21 @@ func addInt64(sum, x int64) (int64, bool) {
 // 判断；待审批、已取消、被拒绝、已过期及预留超时的请求不占用额度），
 // 该检查针对备份保存的资金占用状态、在恢复时的到期自动退回之前完成：
 // 合计恰好等于上限合法，上限恰为 MaxInt64 时也不缩小可接受的金额范围。
+// 此外，每笔已保存请求的预估费用本身也不得严格超过其关联策略保存的完整
+// 累计上限：正常受理时现存占用非负，预估费用一旦严格超过累计上限，申请
+// 在受理前就会被拒绝（只留下不关联请求的拒绝账本记录），不可能成为已
+// 保存的请求。只要存在一笔即整体拒绝恢复（错误指出使用账户、请求编号与
+// 策略编号，并说明保存的预估费用与累计上限），不能跳过该请求、降低预估
+// 费用或改大策略上限后继续恢复，同一备份中的合法请求也不能被部分恢复。
+// 这里比较的是策略保存的完整累计上限，不是恢复时的剩余额度：合法请求可能
+// 因其他请求后来占用了额度而暂时无法批准，这不构成备份无效；预估费用恰
+// 等于累计上限时只要其余校验全部通过就应接受。已保存为请求的申请不因现在
+// 不占用额度而豁免：仍待审批、后来被拒绝、取消或过期，以及曾预留后按较低
+// 实际费用结算的历史，都遵循同一规则；同一策略下已经退回的历史预估费用
+// 合计超过上限，也不能仅因此拒绝。该核对只看备份保存的预估费用与策略上限，
+// 与恢复时的当前时间无关：即使超限请求的期限已过，也不能先自动处理到期再
+// 接受矛盾备份。未被受理申请留下的独立拒绝账本记录不属于保存的请求，仍按
+// 现有规则保留。
 // 任一账户的可用余额加上该账户在所有策略下仍处于已预留
 // 状态的费用之和超出 int64 上限时同样拒绝（即使各请求、各策略金额分别
 // 合法）：否则取消或预留超时的退回会使余额越界；校验在恢复时的到期
@@ -1109,6 +1124,19 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 	}
 	if r.estimatedFee > p.maxPerRequest {
 		return fmt.Errorf("estimated fee %d exceeds policy per-request limit %d", r.estimatedFee, p.maxPerRequest)
+	}
+	// 每笔已受理请求的预估费用都不得超过关联策略的完整累计上限：正常受理时
+	// 现存占用（预留+已花费）非负，预估费用一旦严格超过累计上限，申请在受理
+	// 前就会被拒绝（只留下不关联请求的拒绝账本记录），不可能成为已保存的
+	// 请求。这里比较的是策略保存的完整累计上限，不是恢复时的剩余额度：合法
+	// 请求可能因其他请求后来占用了额度而暂时无法批准，这不构成矛盾；预估
+	// 费用恰等于累计上限合法。已保存为请求的申请不因现在不占用额度而豁免：
+	// 仍待审批、后来被拒绝、取消或过期，以及曾预留后按较低实际费用结算的
+	// 历史，都遵循同一规则。该核对只看备份保存的预估费用与策略上限，与恢复
+	// 时的当前时间无关，也不能先按当前时间处理到期再接受矛盾备份。
+	if r.estimatedFee > p.maxTotal {
+		return fmt.Errorf("usage account %q request %q estimated fee %d exceeds policy %q cumulative total limit %d: a fee above the full cumulative limit can never be accepted",
+			r.accountID, r.requestID, r.estimatedFee, p.id, p.maxTotal)
 	}
 	if r.approverAccountID != "" && r.approverAccountID != r.payerAccountID {
 		return fmt.Errorf("approver account %q is not the payer %q", r.approverAccountID, r.payerAccountID)
