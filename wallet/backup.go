@@ -400,6 +400,19 @@ func addInt64(sum, x int64) (int64, bool) {
 // 的请求继续沿用已有行为：停用后才结算或取消的历史正常恢复，保留原状态、
 // 金额、审批信息、预留期限与已有账本，不因本核对补写停用、拒绝或退款
 // 记录。未停用策略下的请求不受此限。
+// 每条标为已停用的策略还必须保存非空的执行账户，且与本策略的出资账户完全
+// 一致：正常停用只允许出资账户操作，执行账户固定记为出资账户，因此字段
+// 缺失或为空字符串（按缺少执行账户处理）、或填入其他任何账户编号（即使该
+// 账户真实存在、在策略允许使用的账户列表里，或是另一条策略的出资账户）的
+// 停用记录都是正常流程不可能产生的矛盾，只要存在一条即整体拒绝恢复（错误
+// 指出策略编号；账户不符时同时给出保存的执行账户与本应执行停用的出资账户），
+// 且不返回钱包。对不存在账户的既有拒绝继续保留。合法的停用时间与理由、余额
+// 与请求金额核对一致，都不能使矛盾记录通过；同一备份的其他记录合法也必须
+// 整体拒绝，不能略过出错策略、补填出资账户或清除停用标记后继续恢复。该核对
+// 只针对备份保存的停用历史，不要求出资账户在恢复时还有有效会话：原会话已经
+// 到期或被吊销，也不否定此前合法的停用；尚未开始或已经结束的策略的合法停用
+// 记录同样被接受。合法的已停用策略恢复后，原停用状态、首次停用时间、执行
+// 账户、理由与已有账本保持不变。
 // 从未预留费用、因等待审批到期进入已过期终态的请求（已预留费用的预留超时
 // 不适用）同样必须通过过期时限核对：保存的等待截止时刻必须存在，并与提交
 // 时刻加策略最长等待时长、策略结束时间、申请会话到期时间三者的最早值一致
@@ -657,16 +670,27 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 			deactivatorAccountID: p.DeactivatorAccountID,
 			deactivateReason:     p.DeactivateReason,
 		}
-		// 停用信息自洽：停用标志必须与停用时间/理由同时出现；停用账户必须
-		// 存在；未停用不得携带任何停用记录。
+		// 停用信息自洽：停用标志必须与停用时间/理由同时出现；执行停用的账户
+		// 必须存在且就是本策略的出资账户（正常停用只允许出资账户操作，执行
+		// 账户固定记为出资账户）；未停用不得携带任何停用记录。
 		if po.deactivated {
 			if po.deactivatedAt.IsZero() || po.deactivateReason == "" {
 				return fmt.Errorf("%w: policy %q marked deactivated but missing deactivation time or reason", ErrBackupInvalid, p.ID)
 			}
-			if po.deactivatorAccountID != "" {
-				if _, ok := accountIDs[po.deactivatorAccountID]; !ok {
-					return fmt.Errorf("%w: policy %q deactivator references unknown account %q", ErrBackupInvalid, p.ID, po.deactivatorAccountID)
-				}
+			// 字段缺失与空字符串都按缺少执行账户处理：正常停用一定会记录
+			// 执行账户，留空的停用记录不可能是正常流程产生的。
+			if po.deactivatorAccountID == "" {
+				return fmt.Errorf("%w: policy %q marked deactivated but missing deactivator account", ErrBackupInvalid, p.ID)
+			}
+			if _, ok := accountIDs[po.deactivatorAccountID]; !ok {
+				return fmt.Errorf("%w: policy %q deactivator references unknown account %q", ErrBackupInvalid, p.ID, po.deactivatorAccountID)
+			}
+			// 执行账户必须就是本策略的出资账户：正常停用只接受出资账户的
+			// 会话，即使备份填入的账户真实存在、在策略允许使用的账户列表里，
+			// 或是另一条策略的出资账户，也不能代替本策略的出资账户。
+			if po.deactivatorAccountID != po.payerAccountID {
+				return fmt.Errorf("%w: policy %q deactivator account %q does not match the policy's payer account %q: only the payer can deactivate a policy",
+					ErrBackupInvalid, p.ID, po.deactivatorAccountID, po.payerAccountID)
 			}
 		} else if !po.deactivatedAt.IsZero() || po.deactivatorAccountID != "" || po.deactivateReason != "" {
 			return fmt.Errorf("%w: policy %q not deactivated but carries deactivation info", ErrBackupInvalid, p.ID)
