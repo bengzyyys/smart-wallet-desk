@@ -303,6 +303,150 @@ func addInt64(sum, x int64) (int64, bool) {
 	return sum + x, true
 }
 
+// requestAmountContribution 表示一笔请求按其在备份中保存的状态，对账户预留
+// 余额、所属策略预留总额与已花费总额三者的金额归属。三个字段均为“本笔贡献
+// 的金额”，为零表示不贡献对应总额。
+type requestAmountContribution struct {
+	// accountReserved 计入其出资账户预留余额的金额（按出资账户跨策略合并）。
+	accountReserved int64
+	// policyReserved 计入所属策略预留总额的金额（同一策略多个使用账户共享）。
+	policyReserved int64
+	// policySpent 计入所属策略已花费总额的金额。
+	policySpent int64
+}
+
+// contributionForRequest 是“请求状态决定金额归属”的唯一规则来源，恢复核对
+// 与求和都经由它，不再各自按状态分支，避免同一笔请求在账户与策略两侧被重复
+// 维护成不一致的规则：
+//   - 已预留（RequestReserved）：按预估费用同时计入出资账户预留余额与所属
+//     策略预留总额——这是当前仍冻结、仍占用共享累计额度的费用；
+//   - 已结算（RequestSettled）：只按实际费用计入所属策略已花费总额。结算时
+//     预估与实际费用的差额已经退回，不能再把退回的差额算作预留占用，因此不
+//     再计入任何预留总额；
+//   - 待审批、已取消、已拒绝、等待审批过期、预留超时：一律不贡献。待审批
+//     从不冻结费用；已取消与预留超时的预留已全额退回；已拒绝与等待审批过期
+//     从未预留。
+//
+// 归属只看备份保存的请求状态，与恢复时的当前时间无关：某笔预留即使已到退款
+// 时间，在恢复时的到期自动释放之前仍按已预留计入，不能先退回再核对。
+func contributionForRequest(state RequestState, estimatedFee, actualFee int64) requestAmountContribution {
+	switch state {
+	case RequestReserved:
+		return requestAmountContribution{accountReserved: estimatedFee, policyReserved: estimatedFee}
+	case RequestSettled:
+		return requestAmountContribution{policySpent: actualFee}
+	default:
+		return requestAmountContribution{}
+	}
+}
+
+// backupAmountTotals 按备份请求状态汇总三类金额：
+//   - reservedByAccount：各出资账户在其所有策略下仍处于已预留状态的预估费用
+//     之和（同一出资账户跨多条策略合并核对）；
+//   - reservedByPolicy：各策略现存已预留请求的预估费用之和；
+//   - spentByPolicy：各策略已结算请求的实际费用之和。
+//
+// 同一策略的多个使用账户共享同一累计额度，故策略金额按策略汇总而不区分使用
+// 账户；不同策略分别汇总、分别核对。所有求和都经 addInt64 检测 int64 溢出。
+type backupAmountTotals struct {
+	reservedByAccount map[string]int64
+	reservedByPolicy  map[string]int64
+	spentByPolicy     map[string]int64
+}
+
+func newBackupAmountTotals() *backupAmountTotals {
+	return &backupAmountTotals{
+		reservedByAccount: make(map[string]int64),
+		reservedByPolicy:  make(map[string]int64),
+		spentByPolicy:     make(map[string]int64),
+	}
+}
+
+// add 按一笔请求保存状态对应的金额归属，把它计入出资账户与所属策略的合计。
+// 账户与策略两侧的归属规则同源于 contributionForRequest，不存在同一笔请求
+// 被按两套规则处理的情况。任一合计越过 int64 范围即返回指出问题账户或策略
+// 的 ErrBackupInvalid（求和溢出类别）。
+func (t *backupAmountTotals) add(r *request) error {
+	c := contributionForRequest(r.state, r.estimatedFee, r.actualFee)
+
+	sum, ok := addInt64(t.reservedByAccount[r.payerAccountID], c.accountReserved)
+	if !ok {
+		return fmt.Errorf("%w: account %q reserved sum overflows int64", ErrBackupInvalid, r.payerAccountID)
+	}
+	t.reservedByAccount[r.payerAccountID] = sum
+
+	sum, ok = addInt64(t.reservedByPolicy[r.policyID], c.policyReserved)
+	if !ok {
+		return fmt.Errorf("%w: policy %q reserved sum overflows int64", ErrBackupInvalid, r.policyID)
+	}
+	t.reservedByPolicy[r.policyID] = sum
+
+	sum, ok = addInt64(t.spentByPolicy[r.policyID], c.policySpent)
+	if !ok {
+		return fmt.Errorf("%w: policy %q spent sum overflows int64", ErrBackupInvalid, r.policyID)
+	}
+	t.spentByPolicy[r.policyID] = sum
+	return nil
+}
+
+// verifyAccountReserved 核对金额不一致：账户保存的预留余额必须等于该账户在
+// 所有策略下现存已预留请求的预估费用之和（一个出资账户在多条策略下的预留
+// 合并核对）。
+func (t *backupAmountTotals) verifyAccountReserved(acc *account) error {
+	if reserved := t.reservedByAccount[acc.id]; acc.reserved != reserved {
+		return fmt.Errorf("%w: account %q reserved %d != sum of reserved requests %d", ErrBackupInvalid, acc.id, acc.reserved, reserved)
+	}
+	return nil
+}
+
+// verifyAccountRefundOverflow 核对求和溢出：可用余额加现存预留不得越过 int64
+// 上限——取消或预留超时会把预留全额退回可用余额，合计一旦越界，退回时余额
+// 就会变负；合计恰好等于上限合法（随后退回恰好得到上限金额）。
+//
+// 两类账户核对只针对备份保存的资金占用状态，必须在恢复时的到期自动退回之前
+// 完成：即使某笔预留恢复时已到期、将全额退回，也不能先退回再让原本矛盾或
+// 超额的备份通过。
+func (t *backupAmountTotals) verifyAccountRefundOverflow(acc *account) error {
+	reserved := t.reservedByAccount[acc.id]
+	if _, ok := addInt64(acc.available, reserved); !ok {
+		return fmt.Errorf("%w: account %q available %d plus reserved %d overflows int64", ErrBackupInvalid, acc.id, acc.available, reserved)
+	}
+	return nil
+}
+
+// verifyPolicy 核对单条策略的备份金额：
+//   - 金额不一致：策略保存的预留总额、已花费总额必须分别等于按请求状态推算
+//     的现存预留预估费用之和与已结算实际费用之和；
+//   - 求和溢出：现存预留与已花费各自为 int64 而合计越过 int64 范围时拒绝，
+//     不能把求和越界误判为额度充足；
+//   - 累计超限：现存预留与已花费合计严格超过共享累计上限时拒绝；恰好等于
+//     上限合法，上限恰为 MaxInt64 时也不缩小可接受的金额范围。
+//
+// 同一策略的多个使用账户合并计算，不同策略分别判断；待审批、已取消、被
+// 拒绝、等待审批过期与预留超时的请求不计入合计（归属规则见
+// contributionForRequest）。核对针对备份保存的资金占用状态，位于恢复时的
+// 到期自动退回之前：已到期预留也不能先退款再掩盖原本的超额。
+func (t *backupAmountTotals) verifyPolicy(p *policy) error {
+	reserved := t.reservedByPolicy[p.id]
+	spent := t.spentByPolicy[p.id]
+	if p.reservedTotal != reserved {
+		return fmt.Errorf("%w: policy %q reserved total %d != sum of reserved requests %d", ErrBackupInvalid, p.id, p.reservedTotal, reserved)
+	}
+	if p.spentTotal != spent {
+		return fmt.Errorf("%w: policy %q spent total %d != sum of settled requests %d", ErrBackupInvalid, p.id, p.spentTotal, spent)
+	}
+	used, ok := addInt64(reserved, spent)
+	if !ok {
+		return fmt.Errorf("%w: policy %q reserved %d plus spent %d overflows int64 and exceeds cumulative total limit %d",
+			ErrBackupInvalid, p.id, reserved, spent, p.maxTotal)
+	}
+	if used > p.maxTotal {
+		return fmt.Errorf("%w: policy %q reserved %d plus spent %d exceeds cumulative total limit %d",
+			ErrBackupInvalid, p.id, reserved, spent, p.maxTotal)
+	}
+	return nil
+}
+
 // Restore 从 Export 产生的 JSON 文本创建一个独立的钱包。
 //
 // 恢复不重新计时：所有截止时刻与会话到期时间沿用备份中的绝对时刻，
@@ -564,7 +708,6 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		return fmt.Errorf("%w: missing accounts", ErrBackupInvalid)
 	}
 	accountIDs := make(map[string]struct{}, len(b.Accounts))
-	reservedByAccount := make(map[string]int64)
 	for i, a := range b.Accounts {
 		if a.ID == "" {
 			return fmt.Errorf("%w: account[%d] has empty id", ErrBackupInvalid, i)
@@ -706,8 +849,10 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		return fmt.Errorf("%w: missing requests", ErrBackupInvalid)
 	}
 	reqKeys := make(map[requestKey]struct{}, len(b.Requests))
-	reservedSumByPolicy := make(map[string]int64)
-	spentSumByPolicy := make(map[string]int64)
+	// totals 按“请求状态决定金额归属”的唯一规则（contributionForRequest）
+	// 汇总各出资账户与各策略的金额，随后与备份保存的余额/总额统一核对；
+	// 账户与策略两侧共用同一份归属结果，不再各自按状态重复累加。
+	totals := newBackupAmountTotals()
 	for i, r := range b.Requests {
 		if err := validateRequestRef(r, i, accountIDs, sessionByID, policyByID); err != nil {
 			return err
@@ -759,33 +904,27 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		}
 		w.requests[key] = req
 
-		// 累加各账户/策略“按请求推算”的金额，稍后与快照余额核对。
-		// 只有当前仍处于已预留的请求才占用账户预留与策略预留总额。
-		if state == RequestReserved {
-			sum, ok := addInt64(reservedByAccount[req.payerAccountID], req.estimatedFee)
-			if !ok {
-				return fmt.Errorf("%w: account %q reserved sum overflows int64", ErrBackupInvalid, req.payerAccountID)
-			}
-			reservedByAccount[req.payerAccountID] = sum
-			sum, ok = addInt64(reservedSumByPolicy[req.policyID], req.estimatedFee)
-			if !ok {
-				return fmt.Errorf("%w: policy %q reserved sum overflows int64", ErrBackupInvalid, req.policyID)
-			}
-			reservedSumByPolicy[req.policyID] = sum
-		}
-		if state == RequestSettled {
-			sum, ok := addInt64(spentSumByPolicy[req.policyID], req.actualFee)
-			if !ok {
-				return fmt.Errorf("%w: policy %q spent sum overflows int64", ErrBackupInvalid, req.policyID)
-			}
-			spentSumByPolicy[req.policyID] = sum
+		// 按备份保存的请求状态把本笔金额归属到出资账户与所属策略，稍后与
+		// 快照余额、策略总额统一核对。归属规则集中在 contributionForRequest：
+		// 只有仍处于已预留的请求才占用账户与策略预留，已结算请求只按实际费用
+		// 计入策略已花费。
+		if err := totals.add(req); err != nil {
+			return err
 		}
 	}
 
+	// ---- 金额核对（只针对备份原有状态，在下方到期自动释放之前完成）----
+	// 全部金额规则集中由 totals 按请求状态归属后核对，与钱包重建分离：
+	// 先核对所有账户的预留余额一致性，再核对“可用+现存预留”的求和溢出，
+	// 最后逐策略核对预留/已花费一致性、求和溢出与累计超限。某笔预留即使已到
+	// 退款时间，也必须按已预留计入这些核对，不能先在恢复时退回它来掩盖备份
+	// 原本的超额或矛盾。
+
 	// ---- 账户预留余额 == 已预留请求预估费用之和 ----
-	for id, acc := range w.accounts {
-		if got, want := acc.reserved, reservedByAccount[id]; got != want {
-			return fmt.Errorf("%w: account %q reserved %d != sum of reserved requests %d", ErrBackupInvalid, id, got, want)
+	// 一个出资账户在多条策略下的预留合并核对。
+	for _, acc := range w.accounts {
+		if err := totals.verifyAccountReserved(acc); err != nil {
+			return err
 		}
 	}
 
@@ -793,39 +932,26 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 	// 取消或预留超时会把预留全额退回可用余额：合计一旦超出 MaxInt64，
 	// 退回时余额就会越界变负。reservedByAccount 按出资账户汇总该账户在
 	// 所有策略下仍处于已预留状态的费用（待审批不冻结费用，已结算、已取消、
-	// 已预留超时的费用不再占用预留，故均不计入）。本检查必须在恢复时的
-	// 到期自动退回之前完成，使“恢复即超时退款”的备份也不能蒙混过关；
-	// 合计恰好等于上限合法（随后退回恰好得到上限金额）。
-	for id, acc := range w.accounts {
-		if _, ok := addInt64(acc.available, reservedByAccount[id]); !ok {
-			return fmt.Errorf("%w: account %q available %d plus reserved %d overflows int64", ErrBackupInvalid, id, acc.available, reservedByAccount[id])
+	// 已预留超时的费用不再占用预留，故均不计入）。合计恰好等于上限合法
+	//（随后退回恰好得到上限金额）。
+	for _, acc := range w.accounts {
+		if err := totals.verifyAccountRefundOverflow(acc); err != nil {
+			return err
 		}
 	}
 
 	// ---- 策略预留总额/已花费总额 == 请求求和，且合计不得超过累计上限 ----
 	// 现存预留费用与已结算的实际费用共同占用策略的共享累计额度；同一策略的
 	// 多个使用账户合计判断，不同策略分别判断。待审批不冻结费用，已取消、被
-	// 拒绝、待审批过期、预留超时的请求均不计入，故上方求和本就不含它们。
+	// 拒绝、待审批过期、预留超时的请求均不计入（见 contributionForRequest）。
 	// 严格超过累计上限的备份自相矛盾（正常流程在受理时就会拒绝），必须整体
 	// 拒绝；合计恰好等于上限合法。本检查针对备份保存的资金占用状态，位于
 	// 恢复时的到期自动退回之前：即使某笔已预留请求恢复时已到期、将全额
 	// 退回，也不能先退回再让原本超额的备份通过。两项金额各自为 int64、
 	// 合计越过 int64 上限时，addInt64 先捕获溢出，不能误判为额度充足。
-	for id, p := range policyByID {
-		if got, want := p.reservedTotal, reservedSumByPolicy[id]; got != want {
-			return fmt.Errorf("%w: policy %q reserved total %d != sum of reserved requests %d", ErrBackupInvalid, id, got, want)
-		}
-		if got, want := p.spentTotal, spentSumByPolicy[id]; got != want {
-			return fmt.Errorf("%w: policy %q spent total %d != sum of settled requests %d", ErrBackupInvalid, id, got, want)
-		}
-		used, ok := addInt64(reservedSumByPolicy[id], spentSumByPolicy[id])
-		if !ok {
-			return fmt.Errorf("%w: policy %q reserved %d plus spent %d overflows int64 and exceeds cumulative total limit %d",
-				ErrBackupInvalid, id, reservedSumByPolicy[id], spentSumByPolicy[id], p.maxTotal)
-		}
-		if used > p.maxTotal {
-			return fmt.Errorf("%w: policy %q reserved %d plus spent %d exceeds cumulative total limit %d",
-				ErrBackupInvalid, id, reservedSumByPolicy[id], spentSumByPolicy[id], p.maxTotal)
+	for _, p := range policyByID {
+		if err := totals.verifyPolicy(p); err != nil {
+			return err
 		}
 	}
 
