@@ -451,7 +451,23 @@ func addInt64(sum, x int64) (int64, bool) {
 // 任一账户的可用余额加上该账户在所有策略下仍处于已预留
 // 状态的费用之和超出 int64 上限时同样拒绝（即使各请求、各策略金额分别
 // 合法）：否则取消或预留超时的退回会使余额越界；校验在恢复时的到期
-// 自动退回之前完成，预留尚未到期也当场拒绝。恢复出的钱包与原钱包、同一
+// 自动退回之前完成，预留尚未到期也当场拒绝。
+// 每条账本记录保存的金额还必须与其记录类型相符（只排除负金额不够）：
+// 预留与退款记录实际记载一笔资金变动，金额必须严格大于零，金额为零也必须
+// 拒绝；扣减记录允许零金额，实际费用为零也是合法结算，零金额扣减记录必须
+// 原样保留且请求仍为已结算，不能把它当成没有发生结算；预留、扣减、退款之外
+// 的全部现有类型（待审批、批准、拒绝、待审批取消、待审批过期、策略停用、
+// 预留超时状态）都是不发生资金变化的状态留痕，金额必须为零。预留超时本就
+// 另有一条正数全额退款和一条零金额状态记录，退款金额不得再次写进状态记录；
+// 待审批取消从未冻结费用，其取消留痕也不能携带资金金额。任何类型仍不接受
+// 负金额。该核对逐条针对记录自身的类型与金额，不看其关联对象是否存在：只要
+// 备份中有一条违反，整个恢复即失败并返回 ErrBackupInvalid，错误指出该记录
+// 在原账本中的位置、记录类型、保存的金额及违反的金额要求，且不返回钱包；
+// 不能跳过该记录、把金额改成零或更换类型后继续恢复，同一备份的账户余额、
+// 策略累计金额与请求求和完全一致也不能掩盖它。未被受理申请的零金额拒绝
+// 记录即使账户或请求编号缺失、关联对象不存在，仍按原规则恢复，本核对不因此
+// 增加账户或请求必须存在的要求；正常备份的账本顺序、时间、原因与关联编号
+// 原样保留，不增添记录或改动余额；空账本同样可以恢复。恢复出的钱包与原钱包、同一
 // 备份恢复出的其他钱包互不影响。
 func Restore(data []byte) (*Wallet, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
@@ -774,8 +790,14 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		if kind < LedgerReserve || kind > LedgerReservationExpiration {
 			return fmt.Errorf("%w: ledger[%d] has unknown kind %d", ErrBackupInvalid, i, e.Kind)
 		}
-		if e.Amount < 0 {
-			return fmt.Errorf("%w: ledger[%d] amount is negative: %d", ErrBackupInvalid, i, e.Amount)
+		// 每条账本记录自身的金额必须与其记录类型相符，不能只排除负金额：
+		// 预留与退款只在实际发生资金变动时记账，金额必须严格为正；扣减允许
+		// 为零，实际费用为零也是一次合法结算；其余类型全部是不发生资金变化
+		// 的状态留痕（待审批、批准、拒绝、待审批取消、待审批过期、策略停用、
+		// 预留超时状态），金额必须为零——预留超时的全额退款另由同笔的
+		// LedgerRefund 记载，待审批取消从未冻结费用，二者都不能再带一笔资金。
+		if err := validateLedgerAmount(kind, e.Amount); err != nil {
+			return fmt.Errorf("%w: ledger[%d] (kind %s/%d): %v", ErrBackupInvalid, i, ledgerKindName(kind), e.Kind, err)
 		}
 		// 账本是历史留痕：其账户/请求编号允许为空或指向不存在的实体。
 		// 未被受理申请（必填字段缺失、使用账户或会话不存在等）同样会留下
@@ -805,6 +827,77 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 	w.expireReservationsLocked(now)
 	w.expirePendingApprovalsLocked(now)
 	return nil
+}
+
+// ledgerKindName 返回账本记录类型的稳定名称，供错误信息定位问题记录；
+// 未知类型（正常流程中已被恢复校验先行拦截）返回数字编号。
+func ledgerKindName(kind LedgerKind) string {
+	switch kind {
+	case LedgerReserve:
+		return "reserve"
+	case LedgerSettle:
+		return "settle"
+	case LedgerRefund:
+		return "refund"
+	case LedgerRejection:
+		return "rejection"
+	case LedgerPendingApproval:
+		return "pending-approval"
+	case LedgerApproval:
+		return "approval"
+	case LedgerCancellation:
+		return "cancellation"
+	case LedgerExpiration:
+		return "pending-approval-expiration"
+	case LedgerPolicyDeactivation:
+		return "policy-deactivation"
+	case LedgerReservationExpiration:
+		return "reservation-expiration"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(kind))
+	}
+}
+
+// validateLedgerAmount 校验单条账本记录保存的金额与其记录类型相符。账本只
+// 按原样留痕，恢复时不依据账本重算余额，因此一条类型与金额不符的记录不会被
+// 余额/累计金额核对发现——它会出现在恢复后的账本中，账户余额却没有对应变化，
+// 调用方无法据此核对费用。各类规则：
+//   - 预留（LedgerReserve）：只在实际冻结费用时记账，金额必须严格大于零；
+//   - 退款（LedgerRefund）：结算差额、已预留取消或预留超时的全额退回都实际
+//     增加可用余额，金额必须严格大于零；零费用结算的全额退回是 settle 差额
+//     等于预留全额的正数退款，不是零金额退款；
+//   - 扣减（LedgerSettle）：金额必须非负，允许为零——实际费用为零也是一次
+//     合法结算，零金额扣减记录必须保留，请求仍为已结算，不能当成未结算；
+//   - 其余类型（拒绝、待审批、批准、待审批取消、待审批过期、策略停用、预留
+//     超时状态）均为不发生资金变化的状态留痕，金额必须为零。预留超时已另有
+//     一条正数全额退款，超时状态记录不能再写进退款金额；待审批取消从未冻结
+//     费用，其取消留痕同样不能携带资金金额。
+//
+// 任何类型都不接受负金额。该核对只看每条记录自身保存的类型与金额，不依赖其
+// 账户、请求或策略是否存在（未被受理申请的零金额拒绝记录允许悬空引用），也
+// 不能被账户余额、策略累计金额与请求求和一致所掩盖：违反即由调用方整体拒绝
+// 恢复，不跳过、不改写金额或类型后继续。
+func validateLedgerAmount(kind LedgerKind, amount int64) error {
+	switch kind {
+	case LedgerReserve, LedgerRefund:
+		if amount < 0 {
+			return fmt.Errorf("%s entry carries a negative amount %d, but its amount must be positive", ledgerKindName(kind), amount)
+		}
+		if amount == 0 {
+			return fmt.Errorf("%s entry carries amount 0, but its amount must be positive: it records an actual fund movement", ledgerKindName(kind))
+		}
+		return nil
+	case LedgerSettle:
+		if amount < 0 {
+			return fmt.Errorf("settle entry carries a negative amount %d, but its amount must be zero or positive", amount)
+		}
+		return nil
+	default:
+		if amount != 0 {
+			return fmt.Errorf("%s status entry carries amount %d, but it records no fund movement and its amount must be zero", ledgerKindName(kind), amount)
+		}
+		return nil
+	}
 }
 
 // validatePolicyParams 校验备份中策略的条件与限额参数，与 SavePolicy 共用
