@@ -383,6 +383,20 @@ func addInt64(sum, x int64) (int64, bool) {
 // 预留超时；已结算、已取消、已拒绝或已过期的请求保留原状态与决定信息；策略
 // 的首次停用时间、执行账户、理由、余额与已有账本顺序原样保留；未停用策略下
 // 的合法待审批请求仍可恢复并继续审批，到期时按原规则过期。
+// 此外，每条标为已停用的策略都必须保存非空的执行停用账户，且与该策略的
+// 出资账户完全一致：正常停用只允许策略的出资账户凭有效会话操作，停用成功后
+// 查询保留的也是这个出资账户，因此恢复已停用策略时执行账户留空（字段缺失与
+// 空字符串均按缺少执行账户处理），或换成钱包里另一个已存在账户——即使该账户
+// 确实存在、在本策略允许使用的账户列表中，或是另一条策略的出资账户——都是正常
+// 停用不可能产生的记录，只要存在一条即整体拒绝恢复（错误指出策略编号与具体
+// 身份问题；账户不符时同时给出保存的执行账户与本应执行停用的出资账户；填入
+// 不存在账户编号的拒绝沿用原有校验），哪怕停用时间、理由合法，余额与请求金额
+// 核对完全一致，即使同一备份的其他账户、策略与请求均合法也不能略过出错策略、
+// 补填出资账户或清除停用标记后继续恢复。该核对只针对备份保存的停用历史，不
+// 要求出资账户在恢复时仍持有有效会话：这是在核对已保存的停用历史，原会话已经
+// 到期或被吊销也不否定此前合法的停用；尚未开始或已经结束的策略原本都允许停用，
+// 其合法停用记录同样接受。合法的已停用策略仍按原停用状态、首次停用时间、执行
+// 账户、理由与已有账本原样恢复；未停用策略继续沿用现有的停用信息校验。
 // 此外，关联已停用策略的每笔已受理请求，其保存的提交时刻不得严格晚于该
 // 策略的首次停用时刻：停用后策略不再受理新申请，停用后才提交的申请只会
 // 留下不关联请求的拒绝账本记录，不可能成为已受理请求；超过审批门槛、经
@@ -657,16 +671,28 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 			deactivatorAccountID: p.DeactivatorAccountID,
 			deactivateReason:     p.DeactivateReason,
 		}
-		// 停用信息自洽：停用标志必须与停用时间/理由同时出现；停用账户必须
-		// 存在；未停用不得携带任何停用记录。
+		// 停用信息自洽：停用标志必须与停用时间/理由同时出现；执行停用的账户
+		// 必须非空、存在且与本策略的出资账户完全一致；未停用不得携带任何停用
+		// 记录。
 		if po.deactivated {
 			if po.deactivatedAt.IsZero() || po.deactivateReason == "" {
 				return fmt.Errorf("%w: policy %q marked deactivated but missing deactivation time or reason", ErrBackupInvalid, p.ID)
 			}
-			if po.deactivatorAccountID != "" {
-				if _, ok := accountIDs[po.deactivatorAccountID]; !ok {
-					return fmt.Errorf("%w: policy %q deactivator references unknown account %q", ErrBackupInvalid, p.ID, po.deactivatorAccountID)
-				}
+			// 正常停用只允许策略的出资账户凭有效会话操作（DeactivatePolicy 直接
+			// 把执行账户记为出资账户），因此已停用策略保存的执行账户必须与出资
+			// 账户完全一致：字段缺失或空字符串按缺少执行账户处理；填入其他账户
+			// 编号——即使该账户确实存在、在本策略允许使用的账户列表中，或是另一
+			// 条策略的出资账户——都按执行账户与出资账户不符处理。对不存在账户的
+			// 拒绝仍由 accountIDs 查找先行保留。合法的停用时间、理由、余额与请求
+			// 金额核对一致都不能使这条矛盾记录通过恢复。
+			if po.deactivatorAccountID == "" {
+				return fmt.Errorf("%w: policy %q marked deactivated but missing deactivator account: only its payer account %q can deactivate a policy", ErrBackupInvalid, p.ID, po.payerAccountID)
+			}
+			if _, ok := accountIDs[po.deactivatorAccountID]; !ok {
+				return fmt.Errorf("%w: policy %q deactivator references unknown account %q", ErrBackupInvalid, p.ID, po.deactivatorAccountID)
+			}
+			if po.deactivatorAccountID != po.payerAccountID {
+				return fmt.Errorf("%w: policy %q saved deactivator account %q does not match its payer account %q: only the payer account that owns the policy can deactivate it", ErrBackupInvalid, p.ID, po.deactivatorAccountID, po.payerAccountID)
 			}
 		} else if !po.deactivatedAt.IsZero() || po.deactivatorAccountID != "" || po.deactivateReason != "" {
 			return fmt.Errorf("%w: policy %q not deactivated but carries deactivation info", ErrBackupInvalid, p.ID)
