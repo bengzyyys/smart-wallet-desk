@@ -1565,21 +1565,25 @@ func TestRestoreAcceptsCumulativeQuotaAtBoundary(t *testing.T) {
 // TestRestoreCumulativeQuotaIgnoresNonOccupyingStates 验证只有现存预留与已
 // 结算实际费用占用累计额度：待审批、审批拒绝、待审批取消、待审批过期、已
 // 预留后取消、预留超时的请求都不占用；结算退回的差额也不计入已花费。
+// （每笔请求自身的预估费用不得超过策略完整累计上限是另一条逐笔规则，由
+// TestRestoreRejectsEstimatedFeeExceedingFullTotal 覆盖；这里各非占用请求
+// 的预估费用 20 恰等于完整累计上限，逐笔核对本就合法。）
 func TestRestoreCumulativeQuotaIgnoresNonOccupyingStates(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	// 累计上限仅 10：一笔实际费用 10 的已结算请求占满额度；其余请求费用均
-	// 为 30（待审批系严格超过门槛 10），但都不占用额度，备份仍合法。
+	// 累计上限 20：一笔实际费用 10 的已结算请求占用 10；其余请求费用均
+	// 为 20（恰等于完整累计上限、且严格超过门槛 10，属于审批路径），但都
+	// 不占用额度，历史预估费用合计远超上限也不影响，备份仍合法。
 	data := buildCumulativeQuotaBackup(t, t0, []quotaPolicySpec{{
-		id: "p-free", per: 100, total: 10, threshold: 10,
+		id: "p-free", per: 100, total: 20, threshold: 10,
 		wait: 5 * time.Minute, reserveDur: time.Minute,
 		reqs: []quotaReqSpec{
 			{id: "settled", account: "u1", estFee: 10, actualFee: 10, state: RequestSettled},
-			{id: "reserved-cancelled", account: "u1", estFee: 10, state: RequestCancelled, wasReserved: true},
-			{id: "reservation-expired", account: "u1", estFee: 10, state: RequestReservationExpired},
-			{id: "pending", account: "u1", estFee: 30, state: RequestPendingApproval},
-			{id: "rejected", account: "u1", estFee: 30, state: RequestRejected, rejectReason: "no"},
-			{id: "pending-expired", account: "u1", estFee: 30, state: RequestExpired},
-			{id: "pending-cancelled", account: "u1", estFee: 30, state: RequestCancelled},
+			{id: "reserved-cancelled", account: "u1", estFee: 20, state: RequestCancelled, wasReserved: true},
+			{id: "reservation-expired", account: "u1", estFee: 20, state: RequestReservationExpired},
+			{id: "pending", account: "u1", estFee: 20, state: RequestPendingApproval},
+			{id: "rejected", account: "u1", estFee: 20, state: RequestRejected, rejectReason: "no"},
+			{id: "pending-expired", account: "u1", estFee: 20, state: RequestExpired},
+			{id: "pending-cancelled", account: "u1", estFee: 20, state: RequestCancelled},
 		},
 	}})
 	w2, err := restoreAt(data, t0)
