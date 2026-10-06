@@ -1,6 +1,9 @@
 package wallet
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Balances 表示账户当前的资金状态，单位均为最小货币单位的整数。
 type Balances struct {
@@ -204,6 +207,35 @@ const (
 	// 全额退款另记一条 LedgerRefund（AccountID 为出资账户，金额为预留全额）。
 	LedgerReservationExpiration
 )
+
+// String 返回账本记录类型的固定英文名称，供备份恢复等错误信息引用，使
+// 调用方无需按底层整数编号辨认记录类型。
+func (k LedgerKind) String() string {
+	switch k {
+	case LedgerReserve:
+		return "reserve"
+	case LedgerSettle:
+		return "settle"
+	case LedgerRefund:
+		return "refund"
+	case LedgerRejection:
+		return "rejection"
+	case LedgerPendingApproval:
+		return "pending-approval"
+	case LedgerApproval:
+		return "approval"
+	case LedgerCancellation:
+		return "cancellation"
+	case LedgerExpiration:
+		return "expiration"
+	case LedgerPolicyDeactivation:
+		return "policy-deactivation"
+	case LedgerReservationExpiration:
+		return "reservation-expiration"
+	default:
+		return fmt.Sprintf("unknown-ledger-kind-%d", int(k))
+	}
+}
 
 // LedgerEntry 是一条账本记录。
 type LedgerEntry struct {

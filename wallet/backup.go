@@ -451,7 +451,23 @@ func addInt64(sum, x int64) (int64, bool) {
 // 任一账户的可用余额加上该账户在所有策略下仍处于已预留
 // 状态的费用之和超出 int64 上限时同样拒绝（即使各请求、各策略金额分别
 // 合法）：否则取消或预留超时的退回会使余额越界；校验在恢复时的到期
-// 自动退回之前完成，预留尚未到期也当场拒绝。恢复出的钱包与原钱包、同一
+// 自动退回之前完成，预留尚未到期也当场拒绝。
+// 账本中的每条记录还必须符合其类型自身的金额规则：预留（LedgerReserve）
+// 与退款（LedgerRefund）记录实际发生的一笔资金划转，金额必须严格大于零；
+// 扣减（LedgerSettle）允许为零——实际费用为零是合法结算，零金额扣减记录
+// 仍表示该请求已完成结算；预留、扣减、退款之外的全部现有类型（拒绝、
+// 待审批、批准、待审批取消、待审批过期、策略停用与预留超时的状态留痕）
+// 都不发生资金变化，金额必须为零：预留超时的全额退款另记一条正数退款
+// 记录，不得再把退款金额写进零金额的预留超时状态记录；待审批取消从未
+// 冻结费用，其取消留痕同样不得携带资金金额。任何类型都不接受负金额。
+// 只要有一条记录违反，整个备份即被拒绝（错误指出该记录在原账本中的
+// 位置、记录类型、保存的金额以及违反的金额要求），绝不跳过该记录、把
+// 金额清零或更换类型后继续恢复；同一备份的账户余额、策略累计金额与
+// 请求求和即使完全一致也不能掩盖这条记录的问题。该核对只看记录自身，
+// 不依赖其账户或请求编号存在：未被受理申请的拒绝记录只要金额为零，
+// 即使账户或请求编号缺失、关联对象不存在，仍按原规则恢复。合法的零
+// 费用结算保留零金额扣减记录与原有的正数退款记录，恢复后的请求保持
+// 已结算；空账本也照常可恢复。恢复出的钱包与原钱包、同一
 // 备份恢复出的其他钱包互不影响。
 func Restore(data []byte) (*Wallet, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
@@ -774,8 +790,12 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 		if kind < LedgerReserve || kind > LedgerReservationExpiration {
 			return fmt.Errorf("%w: ledger[%d] has unknown kind %d", ErrBackupInvalid, i, e.Kind)
 		}
-		if e.Amount < 0 {
-			return fmt.Errorf("%w: ledger[%d] amount is negative: %d", ErrBackupInvalid, i, e.Amount)
+		// 每条记录的金额必须符合该类型自身的资金语义：预留/退款严格为正，
+		// 扣减允许为零（零实际费用是合法结算），其余状态留痕必须为零；
+		// 任何类型都不接受负金额。该校验只看记录自身，不依赖余额或请求
+		// 求和，因此金额核对一致也不能让带正数的状态记录通过。
+		if err := validateLedgerEntryAmount(kind, e.Amount); err != nil {
+			return fmt.Errorf("%w: ledger[%d] (kind %s): %v", ErrBackupInvalid, i, kind, err)
 		}
 		// 账本是历史留痕：其账户/请求编号允许为空或指向不存在的实体。
 		// 未被受理申请（必填字段缺失、使用账户或会话不存在等）同样会留下
@@ -804,6 +824,45 @@ func (w *Wallet) restoreLocked(b *backupV1) error {
 	now := w.now()
 	w.expireReservationsLocked(now)
 	w.expirePendingApprovalsLocked(now)
+	return nil
+}
+
+// validateLedgerEntryAmount 校验单条账本记录的金额与其类型相符：
+//   - LedgerReserve（预留）与 LedgerRefund（退款）记录的是实际发生的一笔
+//     资金划转，金额必须严格大于零；零金额的预留或退款在正常流程中从不
+//     产生（实际费用为零的结算只有扣减记录、没有退款记录）；
+//   - LedgerSettle（扣减）允许为零：实际费用为零是合法结算，零金额扣减
+//     记录仍表示该请求已完成结算，不能当成没有发生结算而丢弃；
+//   - 其余所有类型（拒绝、待审批、批准、取消、待审批过期、策略停用、
+//     预留超时状态留痕）都不发生资金变化，金额必须为零。预留超时的全额
+//     退款单独记一条 LedgerRefund，不得再写进预留超时状态记录；待审批
+//     取消从未冻结费用，其取消留痕同样不得携带资金金额；
+//   - 任何类型都不接受负金额。
+//
+// 规则只针对单条记录自身，与其账户、请求编号是否存在、账户余额及策略
+// 累计金额是否与请求求和一致无关：即使其余金额核对全部通过，一条类型与
+// 金额不符的记录也会使整个备份被拒绝。
+func validateLedgerEntryAmount(kind LedgerKind, amount int64) error {
+	switch kind {
+	case LedgerReserve, LedgerRefund:
+		if amount < 0 {
+			return fmt.Errorf("%s entry amount must not be negative, got %d; a %s entry must carry a positive amount", kind, amount, kind)
+		}
+		if amount == 0 {
+			return fmt.Errorf("%s entry amount is 0; a %s entry records an actual funds movement and must carry a positive amount", kind, kind)
+		}
+	case LedgerSettle:
+		if amount < 0 {
+			return fmt.Errorf("settle entry amount must not be negative, got %d; a settle entry must carry a non-negative amount (zero is a legal zero-fee settlement)", amount)
+		}
+	default:
+		if amount < 0 {
+			return fmt.Errorf("%s status entry amount must not be negative, got %d; a %s entry records no funds movement and must carry zero amount", kind, amount, kind)
+		}
+		if amount > 0 {
+			return fmt.Errorf("%s status entry carries amount %d; a %s entry records no funds movement and must carry zero amount", kind, amount, kind)
+		}
+	}
 	return nil
 }
 
