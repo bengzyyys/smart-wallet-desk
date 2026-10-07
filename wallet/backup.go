@@ -351,6 +351,18 @@ func addInt64(sum, x int64) (int64, bool) {
 // 完成的合法取消即使很久以后才恢复、申请会话已过期或吊销、策略已结束或
 // 停用，仍保持原取消状态、决定时间与账本顺序，不追加过期或退款记录，不
 // 冻结余额、不占用额度；矛盾的已取消记录不会被自动改成过期来接受备份。
+// 曾在待审批状态取消、从未预留费用的请求，若关联策略已停用，其取消决定
+// 时刻还不得严格晚于该策略的首次停用时刻：停用瞬间该策略全部待审批请求
+// 已立即结清（未到等待期限的拒绝、已到期限的过期），此后不存在可取消的
+// 待审批请求，正常流程不可能产生这样的取消历史。取消与停用记为同一绝对
+// 时刻时可以接受（取消先完成、停用随后完成，二者可能共享同一个时间戳）；
+// 只要存在一笔严格更晚的矛盾即整体拒绝恢复（错误指出使用账户、请求编号
+// 与策略编号，并说明取消时间晚于首次停用时间），不能靠删除该请求、改写
+// 取消时间或把它转换成拒绝、过期来接受备份。停用前已实际预留费用的请求
+// 不受此限：它们本就可以在停用后取消并退回预留；经批准后预留再取消的
+// 请求沿用既有规则，其审批决定时间不被当成取消时间。该核对只依据备份
+// 记载的历史，与恢复时的当前时间无关：恢复时等待期限是否已经过去不影响
+// 结论。
 // 此外，任一仍处于待审批状态的请求都不得关联已吊销的申请会话：主动吊销
 // 申请会话时，吊销发生在等待截止时刻之前的待审批请求会立即进入拒绝终态，
 // 恰到或超过截止时刻的进入过期终态，二者皆终态，不可能继续等待出资账户
@@ -1251,6 +1263,11 @@ func validateRequestTimingAndState(r *request, p *policy, sess *session) error {
 			if err := validateWaitDecisionTiming(r, "cancellation"); err != nil {
 				return err
 			}
+			// 关联策略已停用时，取消决定还不得严格晚于首次停用时刻：停用
+			// 瞬间全部待审批请求已结清，此后不存在可取消的待审批请求。
+			if err := validatePendingCancellationDeactivation(r, p); err != nil {
+				return err
+			}
 		}
 	case RequestPendingApproval:
 		// 待审批不冻结余额：不得有实际费用，且等待期限必须等于
@@ -1407,6 +1424,35 @@ func validateWaitDecisionTiming(r *request, actionNoun string) error {
 	}
 	if !r.decidedAt.Before(r.waitDeadline) {
 		return fmt.Errorf("%s decided_at %v is not strictly before wait deadline %v", actionNoun, r.decidedAt, r.waitDeadline)
+	}
+	return nil
+}
+
+// validatePendingCancellationDeactivation 校验“待审批阶段取消、从未预留费用”
+// 的请求：若关联策略已停用，其取消决定时刻不得严格晚于该策略的首次停用时刻。
+// 策略停用瞬间会结清该策略全部待审批请求（未到等待期限的立即拒绝、已到或超过
+// 期限的进入过期终态），此后不再存在可取消的待审批请求，因此“停用之后才决定
+// 取消”的待审批取消历史是正常流程不可能产生的矛盾记录，必须整体拒绝恢复，
+// 不能靠删除该请求、改写取消时间或把它转换成拒绝、过期来接受备份。取消与停用
+// 记为同一绝对时刻时可以接受：取消先完成、停用随后完成，二者可能共享同一个
+// 时间戳，只有严格更晚才矛盾。
+//
+// 已预留费用的请求不受此限：停用前已实际预留的请求本就可以在停用后取消并退回
+// 预留（由调用方按 reservedOrigin 区分，本函数只在从未预留的待审批取消分支
+// 调用）；经批准后预留再取消的请求同样沿用既有规则，其审批决定时间是批准时刻、
+// 不是取消时间。未停用策略下的待审批取消沿用原有期限规则，本函数直接放行。
+//
+// 时间一律按保存的完整时刻以 time.Time 的绝对瞬间比较（After）：纳秒精度
+// 保留，晚一纳秒也属于停用后取消；不同时区表示的同一时刻判定相同。该核对只
+// 针对备份记载的历史时刻，与恢复时的当前时间无关：恢复时等待期限是否已经过去
+// 不改变结论，也不能先把请求按当前时间自动过期再接受矛盾备份。
+func validatePendingCancellationDeactivation(r *request, p *policy) error {
+	if !p.deactivated {
+		return nil
+	}
+	if r.decidedAt.After(p.deactivatedAt) {
+		return fmt.Errorf("usage account %q request %q was cancelled from pending approval at %v, after policy %q was first deactivated at %v: deactivation immediately settles every pending-approval request, so no pending cancellation can be decided later",
+			r.accountID, r.requestID, r.decidedAt, p.id, p.deactivatedAt)
 	}
 	return nil
 }
